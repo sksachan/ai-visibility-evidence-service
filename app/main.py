@@ -7,6 +7,13 @@ app = FastAPI(title="AI Visibility Evidence Service")
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data/evidence-runs"))
 
+@app.get("/")
+def root():
+    return {
+        "status": "ok",
+        "service": "ai-visibility-evidence-service"
+    }
+
 
 @app.get("/health")
 def health():
