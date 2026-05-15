@@ -20,6 +20,7 @@ def root():
 @app.get("/health")
 def health():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+
     return {
         "status": "ok",
         "service": "ai-visibility-evidence-service",
