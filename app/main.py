@@ -7,7 +7,7 @@ import sys
 app = FastAPI(title="AI Visibility Evidence Service")
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data/evidence-runs"))
-
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 @app.get("/")
 def root():
@@ -19,12 +19,16 @@ def root():
 
 @app.get("/health")
 def health():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     return {
         "status": "ok",
         "service": "ai-visibility-evidence-service",
         "python": sys.version,
         "data_dir": str(DATA_DIR),
         "data_dir_exists": DATA_DIR.exists(),
+        "data_dir_is_dir": DATA_DIR.is_dir(),
+        "volume_root_exists": Path("/data").exists(),
+        "volume_root_is_dir": Path("/data").is_dir(),
         "port_env": os.getenv("PORT")
     }
 
