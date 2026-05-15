@@ -4,7 +4,7 @@ import zipfile
 from typing import Optional
 
 
-ADMIN_SEED_TOKEN = os.getenv("ADMIN_SEED_TOKEN", "")
+ADMIN_SEED_TOKEN = os.getenv("ADMIN_SEED_TOKEN", "ad6878sd8d87sd87")
 
 REQUIRED_FILES = {
     "audit_context.json": [
