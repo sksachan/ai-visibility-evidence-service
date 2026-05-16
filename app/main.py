@@ -9,6 +9,7 @@ import shutil
 import sys
 import zipfile
 from app.evidence_jobs import router as evidence_jobs_router
+from app.parity_jobs import router as parity_jobs_router
 
 
 app = FastAPI(title="AI Visibility Evidence Service")
@@ -258,6 +259,24 @@ def debug_routes():
         ]
     }
 
+@app.get("/health")
+def health():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    return {
+        "status": "ok",
+        "service": "ai-visibility-evidence-service",
+        "python": sys.version,
+        "data_dir": str(DATA_DIR),
+        "data_dir_exists": DATA_DIR.exists(),
+        "data_dir_is_dir": DATA_DIR.is_dir(),
+        "volume_root_exists": Path("/data").exists(),
+        "volume_root_is_dir": Path("/data").is_dir(),
+        "port_env": os.getenv("PORT")
+    }
+
 app.include_router(crawl_jobs_router)
 
 app.include_router(evidence_jobs_router)
+
+app.include_router(parity_jobs_router)

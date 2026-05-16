@@ -3,6 +3,7 @@ uvicorn[standard]
 pydantic
 python-multipart
 requests
+httpx
 beautifulsoup4
 lxml
 trafilatura
@@ -11,3 +12,4 @@ markdownify
 playwright
 pypdf
 PyYAML
+python-dotenv
