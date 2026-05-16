@@ -1,3 +1,4 @@
+from app.crawl_jobs import router as crawl_jobs_router
 from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
 from pathlib import Path
 from typing import Optional
@@ -255,3 +256,5 @@ def debug_routes():
             for route in app.routes
         ]
     }
+
+app.include_router(crawl_jobs_router)
