@@ -8,6 +8,7 @@ import os
 import shutil
 import sys
 import zipfile
+from app.evidence_jobs import router as evidence_jobs_router
 
 
 app = FastAPI(title="AI Visibility Evidence Service")
@@ -258,3 +259,5 @@ def debug_routes():
     }
 
 app.include_router(crawl_jobs_router)
+
+app.include_router(evidence_jobs_router)
