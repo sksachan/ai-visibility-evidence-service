@@ -14,7 +14,7 @@ app = FastAPI(title="AI Visibility Evidence Service")
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data/evidence-runs"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-ADMIN_SEED_TOKEN = os.getenv("ADMIN_SEED_TOKEN", "")
+ADMIN_SEED_TOKEN = os.getenv("ADMIN_SEED_TOKEN", "ad6878sd8d87sd87")
 
 REQUIRED_FILES = {
     "audit_context.json": [
