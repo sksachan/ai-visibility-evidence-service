@@ -187,3 +187,71 @@ async def seed_run(
         "status": "seeded",
         "manifest": manifest
     }
+
+@app.get("/runs/latest")
+def get_latest_run(brand: str, market: str):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    key = f"{brand.lower()}_{market.lower()}".replace(" ", "_")
+    latest_path = DATA_DIR / "latest" / f"{key}.json"
+
+    if not latest_path.exists():
+        return {
+            "status": "not_found",
+            "message": "No latest run found for this brand/market",
+            "brand": brand,
+            "market": market,
+            "expected_path": str(latest_path),
+            "data_dir": str(DATA_DIR)
+        }
+
+    return json.loads(latest_path.read_text(encoding="utf-8"))
+
+
+@app.get("/runs/{run_id}/compact")
+def get_compact_run(run_id: str):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    compact_path = DATA_DIR / run_id / "compact_bundle.json"
+
+    if not compact_path.exists():
+        return {
+            "status": "not_found",
+            "message": "No compact bundle found for this run_id",
+            "run_id": run_id,
+            "expected_path": str(compact_path),
+            "data_dir": str(DATA_DIR)
+        }
+
+    return json.loads(compact_path.read_text(encoding="utf-8"))
+
+
+@app.get("/runs/{run_id}/manifest")
+def get_run_manifest(run_id: str):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    manifest_path = DATA_DIR / run_id / "run_manifest.json"
+
+    if not manifest_path.exists():
+        return {
+            "status": "not_found",
+            "message": "No manifest found for this run_id",
+            "run_id": run_id,
+            "expected_path": str(manifest_path),
+            "data_dir": str(DATA_DIR)
+        }
+
+    return json.loads(manifest_path.read_text(encoding="utf-8"))
+
+
+@app.get("/debug/routes")
+def debug_routes():
+    return {
+        "routes": [
+            {
+                "path": route.path,
+                "methods": sorted(list(route.methods or []))
+            }
+            for route in app.routes
+        ]
+    }
