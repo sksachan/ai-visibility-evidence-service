@@ -4,7 +4,7 @@ import os
 import time
 import uuid
 import threading
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +46,9 @@ class ParallelParityRequest(BaseModel):
 
     playwright_timeout_ms: int = 60000
     pdf_max_pages: int = 80
+
+    # Hard timeout per batch. Prevents one slow page batch blocking the whole job.
+    batch_timeout_seconds: int = 300
 
     owned_domains: list[str] = Field(default_factory=lambda: [
         "nissan.co.jp",
@@ -259,18 +262,27 @@ def run_stage_parallel(
         return
 
     max_workers = max(1, int(req.max_parallel_batches or 1))
+    batch_timeout = max(60, int(getattr(req, "batch_timeout_seconds", 300) or 300))
 
     update_job(job_id, {
         "stage": f"crawl_{kind}",
         "total_batches": len(batches),
         "max_parallel_batches": max_workers,
+        "batch_timeout_seconds": batch_timeout,
     })
 
     completed_batches = 0
+    submitted_batches = 0
 
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {}
-        for batch_index, batch in enumerate(batches, start=1):
+        pending = {}
+
+        def submit_next():
+            nonlocal submitted_batches
+            if submitted_batches >= len(batches):
+                return
+            batch_index = submitted_batches + 1
+            batch = batches[submitted_batches]
             future = executor.submit(
                 scrape_batch_worker,
                 batch,
@@ -280,71 +292,143 @@ def run_stage_parallel(
                 req.playwright_timeout_ms,
                 req.pdf_max_pages,
             )
-            future_map[future] = {
+            pending[future] = {
                 "batch_index": batch_index,
                 "batch_size": len(batch),
                 "urls": [x.get("url") or x.get("source_url") for x in batch],
+                "started_at": now_epoch(),
             }
+            submitted_batches += 1
 
-        for future in as_completed(future_map):
-            meta = future_map[future]
-            batch_index = meta["batch_index"]
+        for _ in range(min(max_workers, len(batches))):
+            submit_next()
 
-            try:
-                payload = future.result()
-            except Exception as e:
-                payload = {
-                    "ok": False,
-                    "kind": kind,
-                    "batch_index": batch_index,
-                    "pages": [],
-                    "failed": [
-                        {
-                            "url": u,
-                            "crawl_status": "failed",
-                            "extraction_status": "parallel_future_error",
-                            "error": str(e)[:2000],
-                        }
-                        for u in meta["urls"]
-                    ],
-                }
+        while pending:
+            done, _ = wait(list(pending.keys()), timeout=5, return_when=FIRST_COMPLETED)
 
-            pages = payload.get("pages", []) or []
-            failed = payload.get("failed", []) or []
+            # Handle completed batches.
+            for future in list(done):
+                meta = pending.pop(future)
+                batch_index = meta["batch_index"]
 
-            if kind == "owned":
-                owned_pages.extend(pages)
-                owned_failed.extend(failed)
-            else:
-                external_pages.extend(pages)
-                external_failed.extend(failed)
+                try:
+                    payload = future.result()
+                except Exception as e:
+                    payload = {
+                        "ok": False,
+                        "kind": kind,
+                        "batch_index": batch_index,
+                        "pages": [],
+                        "failed": [
+                            {
+                                "url": u,
+                                "crawl_status": "failed",
+                                "extraction_status": "parallel_future_error",
+                                "error": str(e)[:2000],
+                            }
+                            for u in meta["urls"]
+                        ],
+                    }
 
-            completed_batches += 1
+                pages = payload.get("pages", []) or []
+                failed = payload.get("failed", []) or []
 
-            write_outputs(
-                target_dir,
-                req,
-                owned_pages,
-                owned_failed,
-                external_pages,
-                external_failed,
-                owned_requested,
-                external_requested,
-            )
+                if kind == "owned":
+                    owned_pages.extend(pages)
+                    owned_failed.extend(failed)
+                else:
+                    external_pages.extend(pages)
+                    external_failed.extend(failed)
 
-            update_job(job_id, {
-                "stage": f"crawl_{kind}",
-                "completed_batches": completed_batches,
-                "total_batches": len(batches),
-                "last_completed_batch": batch_index,
-                "last_batch_ok": payload.get("ok", False),
-                "last_batch_pages": len(pages),
-                "last_batch_failed": len(failed),
-                "owned_collected_so_far": len(owned_pages),
-                "owned_failed_so_far": len(owned_failed),
-                "external_collected_so_far": len(external_pages),
-                "external_failed_so_far": len(external_failed),
-            })
+                completed_batches += 1
+
+                write_outputs(
+                    target_dir,
+                    req,
+                    owned_pages,
+                    owned_failed,
+                    external_pages,
+                    external_failed,
+                    owned_requested,
+                    external_requested,
+                )
+
+                update_job(job_id, {
+                    "stage": f"crawl_{kind}",
+                    "completed_batches": completed_batches,
+                    "submitted_batches": submitted_batches,
+                    "total_batches": len(batches),
+                    "last_completed_batch": batch_index,
+                    "last_batch_ok": payload.get("ok", False),
+                    "last_batch_pages": len(pages),
+                    "last_batch_failed": len(failed),
+                    "owned_collected_so_far": len(owned_pages),
+                    "owned_failed_so_far": len(owned_failed),
+                    "external_collected_so_far": len(external_pages),
+                    "external_failed_so_far": len(external_failed),
+                })
+
+                submit_next()
+
+            # Mark timed-out batches as failed and move on.
+            now = now_epoch()
+            for future, meta in list(pending.items()):
+                elapsed = now - int(meta.get("started_at") or now)
+                if elapsed < batch_timeout:
+                    continue
+
+                pending.pop(future)
+                batch_index = meta["batch_index"]
+
+                failed = [
+                    {
+                        "url": u,
+                        "crawl_status": "failed",
+                        "extraction_status": "batch_timeout",
+                        "error": f"Batch {batch_index} exceeded hard timeout of {batch_timeout}s",
+                    }
+                    for u in meta["urls"]
+                ]
+
+                if kind == "owned":
+                    owned_failed.extend(failed)
+                else:
+                    external_failed.extend(failed)
+
+                completed_batches += 1
+
+                write_outputs(
+                    target_dir,
+                    req,
+                    owned_pages,
+                    owned_failed,
+                    external_pages,
+                    external_failed,
+                    owned_requested,
+                    external_requested,
+                )
+
+                update_job(job_id, {
+                    "stage": f"crawl_{kind}",
+                    "completed_batches": completed_batches,
+                    "submitted_batches": submitted_batches,
+                    "total_batches": len(batches),
+                    "last_completed_batch": batch_index,
+                    "last_batch_ok": False,
+                    "last_batch_failed": len(failed),
+                    "last_batch_timeout": True,
+                    "timed_out_urls": meta["urls"],
+                    "owned_collected_so_far": len(owned_pages),
+                    "owned_failed_so_far": len(owned_failed),
+                    "external_collected_so_far": len(external_pages),
+                    "external_failed_so_far": len(external_failed),
+                })
+
+                # Try to cancel; if the worker keeps running, the process pool may retain it,
+                # but this prevents the orchestration loop from waiting indefinitely.
+                future.cancel()
+
+                submit_next()
 
 
 def run_parallel_parity(job_id: str, req: ParallelParityRequest):
