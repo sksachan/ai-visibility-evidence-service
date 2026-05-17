@@ -69,6 +69,7 @@ def write_run_status(run_id: str, status: str, patch: dict[str, Any] | None = No
 def store_portfolio(portfolio: dict[str, Any], fallback_brand: str, fallback_market: str, fallback_domain: str | None = None) -> dict[str, Any]:
     pid = portfolio.get("portfolio_id") or f"portfolio_{normalise_key(fallback_brand)}_{normalise_key(fallback_market)}_{now_epoch()}_{uuid.uuid4().hex[:6]}"
     portfolio["portfolio_id"] = pid
+    portfolio.setdefault("schema_version", "brand_topic_query_portfolio.v1")
     portfolio.setdefault("brand", fallback_brand)
     portfolio.setdefault("market", fallback_market)
     if fallback_domain and not portfolio.get("domain"):
@@ -87,7 +88,38 @@ def load_portfolio(portfolio_id: str) -> dict[str, Any] | None:
     return read_json(portfolio_dir() / f"{portfolio_id}.json")
 
 
+def load_latest_portfolio(brand: str | None, market: str | None, domain: str | None = None) -> dict[str, Any] | None:
+    keys: list[str] = []
+    if domain:
+        keys.append(f"{normalise_key(brand)}__{normalise_key(market)}__{normalise_key(domain)}")
+    keys.append(f"{normalise_key(brand)}__{normalise_key(market)}")
+    for key in keys:
+        payload = read_json(portfolio_dir() / "latest" / f"{key}.json")
+        if isinstance(payload, dict) and isinstance(payload.get("queries"), list) and payload.get("queries"):
+            payload.setdefault("schema_version", "brand_topic_query_portfolio.v1")
+            return payload
+    return None
+
+
+def is_usable_portfolio(portfolio: dict[str, Any] | None, min_created_at: int | None = None) -> bool:
+    if not isinstance(portfolio, dict):
+        return False
+    if not isinstance(portfolio.get("queries"), list) or not portfolio.get("queries"):
+        return False
+    if not isinstance(portfolio.get("topics"), list) or not portfolio.get("topics"):
+        return False
+    if min_created_at is not None:
+        try:
+            created = int(portfolio.get("created_at_epoch") or 0)
+        except Exception:
+            created = 0
+        if created and created < min_created_at:
+            return False
+    return True
+
+
 def trigger_and_wait_for_portfolio(req: dict[str, Any], target_run_id: str) -> dict[str, Any]:
+    run_started_epoch = now_epoch()
     task_id = os.getenv("BODHI_PORTFOLIO_TASK_ID", "")
     workflow_id = os.getenv("BODHI_PORTFOLIO_WORKFLOW_ID", "")
     if not task_id:

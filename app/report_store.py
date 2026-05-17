@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 try:
     from app.evidence_jobs import FullRefreshRequest, run_full_refresh, make_job_id, update_job
@@ -178,7 +178,11 @@ class RunStatusRequest(BaseModel):
 
 
 class PortfolioRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     portfolio_id: str | None = None
+    schema_version: str | None = "brand_topic_query_portfolio.v1"
+    deepresearch_status: str | None = None
     brand: str
     market: str
     domain: str | None = None
@@ -349,8 +353,9 @@ def get_run_statuses(brand: str | None = None, market: str | None = None, domain
 def store_query_portfolio(req: PortfolioRequest, x_admin_token: str | None = Header(default=None)):
     require_admin(x_admin_token)
     portfolio_id = req.portfolio_id or f"portfolio_{normalise_key(req.brand)}_{normalise_key(req.market)}_{now_epoch()}_{uuid.uuid4().hex[:6]}"
-    payload = req.model_dump()
+    payload = req.model_dump(exclude_none=True)
     payload["portfolio_id"] = portfolio_id
+    payload.setdefault("schema_version", "brand_topic_query_portfolio.v1")
     payload["created_at_epoch"] = now_epoch()
     write_json(portfolio_dir() / f"{portfolio_id}.json", payload)
 
