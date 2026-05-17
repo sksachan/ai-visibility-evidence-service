@@ -360,16 +360,11 @@ def store_query_portfolio(req: PortfolioRequest, x_admin_token: str | None = Hea
     return {"status": "stored", "portfolio_id": portfolio_id, "portfolio": payload}
 
 
-@router.get("/portfolios/{portfolio_id}")
-def get_query_portfolio(portfolio_id: str):
-    payload = read_json(portfolio_dir() / f"{portfolio_id}.json")
-    if not payload:
-        raise HTTPException(status_code=404, detail=f"No portfolio found for portfolio_id={portfolio_id}")
-    return payload
-
-
 @router.get("/portfolios/latest")
 def get_latest_query_portfolio(brand: str = Query(...), market: str = Query(...), domain: str | None = None):
+    # IMPORTANT: this static route must be registered before /portfolios/{portfolio_id}.
+    # Otherwise FastAPI treats "latest" as a portfolio_id and returns
+    # "No portfolio found for portfolio_id=latest".
     keys = []
     if domain:
         keys.append(safe_brand_market_domain(brand, market, domain))
@@ -379,6 +374,14 @@ def get_latest_query_portfolio(brand: str = Query(...), market: str = Query(...)
         if payload:
             return payload
     raise HTTPException(status_code=404, detail="No latest portfolio found")
+
+
+@router.get("/portfolios/{portfolio_id}")
+def get_query_portfolio(portfolio_id: str):
+    payload = read_json(portfolio_dir() / f"{portfolio_id}.json")
+    if not payload:
+        raise HTTPException(status_code=404, detail=f"No portfolio found for portfolio_id={portfolio_id}")
+    return payload
 
 
 @router.post("/refresh/evidence")
