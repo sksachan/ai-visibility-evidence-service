@@ -1,107 +1,106 @@
-# AI Visibility Evidence Service v3
+# AI Visibility Evidence Service v3.3
 
-Railway service for AI Brand Visibility evidence storage, refresh orchestration and report-bundle retrieval.
+Railway evidence execution layer for the AI Brand Visibility dashboard.
 
-## Responsibility boundary
+## Core responsibilities
 
-The evidence service owns evidence acquisition and storage:
+- Store latest successful `frontend_report_bundle` for dashboard loading.
+- Track refresh run status separately from latest successful report data.
+- Store synthetic/manual query portfolios.
+- Execute evidence refresh stages owned by Railway: sitemap inventory, query-owned URL mapping seed, SerpAPI collection, owned URL crawl, external citation crawl.
+- Trigger Bodhi Brand Topic Query Builder when `query_portfolio_mode=synthetic` and no `query_portfolio_id` is supplied.
+- Optionally trigger Bodhi Auditor after evidence collection.
 
-- SerpAPI / Google AI Mode collection
-- Sitemap / URL inventory storage
-- Owned URL crawling
-- External citation URL crawling
-- Evidence run status
-- Latest successful report bundle retrieval
-- Synthetic/manual query portfolio storage
+## Required Railway start command
 
-The Bodhi Auditor workflow consumes evidence from this service, builds the canonical `frontend_report_bundle`, runs synthesis, and stores the completed report bundle back here.
+```bash
+python start.py
+```
 
-## Key endpoints
-
-### Health
-
-`GET /health`
-
-### Latest successful report bundle
-
-`GET /runs/latest/report-bundle?brand=Nissan&market=Japan`
-
-Alias:
-
-`GET /reports/latest-successful?brand=Nissan&market=Japan`
-
-These return only a completed successful report. They intentionally ignore in-progress or failed refreshes.
-
-### Store/read report bundles
-
-`POST /runs/{run_id}/report-bundle`
-
-Stores the Bodhi-produced `frontend_report_bundle.json` and marks the run successful.
-
-`GET /runs/{run_id}/report-bundle`
-
-Reads a specific report bundle.
-
-### Run status
-
-`POST /runs/{run_id}/status`
-
-`GET /runs/{run_id}/status`
-
-`GET /runs/status?brand=Nissan&market=Japan`
-
-The dashboard can poll this while continuing to display the latest successful report.
-
-### Refresh evidence
-
-`POST /refresh/evidence`
-
-Creates a new evidence refresh run and starts the existing crawler flow where possible. The dashboard should not switch report data until a new successful Bodhi report bundle is stored.
-
-### Query portfolio storage
-
-`POST /portfolios`
-
-`GET /portfolios/{portfolio_id}`
-
-`GET /portfolios/latest?brand=Nissan&market=Japan`
-
-The synthetic DeepResearch workflow should write its generated topic/query portfolio here. The Auditor workflow reads it by `query_portfolio_id`; the two Bodhi workflows do not need direct coupling.
-
-### Existing compatibility endpoints
-
-The v2 endpoints remain available, including:
-
-- `GET /runs/{run_id}/bodhi-compact`
-- `GET /runs/{run_id}/compact`
-- `POST /admin/seed-run`
-- `POST /jobs/full-refresh`
-- `POST /jobs/collect-serpapi`
+Do not use `$PORT` directly in the Railway Start Command. `start.py` reads and validates `PORT`.
 
 ## Environment variables
 
-Required/recommended:
+Required for app runtime:
 
 ```text
 DATA_DIR=/data/evidence-runs
-ADMIN_TOKEN=<server-side admin token>
-SERPAPI_KEY=<optional; only needed when SerpAPI collection is enabled>
+PUBLIC_EVIDENCE_SERVICE_URL=https://ai-visibility-evidence-service-production.up.railway.app
 ```
 
-Keep `SERPAPI_KEY` in Railway only. Do not pass it to Bodhi.
+Required for synthetic portfolio orchestration:
 
-## Railway start command
-
-Use this exact start command if Railway UI asks for one:
-
-```bash
-./start.sh
+```text
+BODHI_API_BASE_URL=https://psaisuite.com/save
+BODHI_PAT_TOKEN=pat_<token>
+BODHI_PORTFOLIO_TASK_ID=<BrandTopicQueryBuilder task id>
+BODHI_PORTFOLIO_WORKFLOW_ID=<optional workflow id>
 ```
 
-Alternative:
+Required if the service should trigger the Auditor after evidence refresh:
 
-```bash
-python -m uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8080}
+```text
+BODHI_AUDITOR_TASK_ID=<Auditor task id>
+BODHI_AUDITOR_WORKFLOW_ID=<optional workflow id>
 ```
 
-Do not use `--port '$PORT'`; the single quotes prevent Railway from expanding the variable and uvicorn receives the literal string `$PORT`.
+Required only for live AI citation collection:
+
+```text
+SERPAPI_KEY=<serpapi key>
+SERPAPI_ENGINE=google_ai_mode
+```
+
+Optional:
+
+```text
+BODHI_PORTFOLIO_TIMEOUT_SECONDS=900
+BODHI_POLL_SECONDS=10
+BODHI_HTTP_TIMEOUT_SECONDS=120
+ADMIN_TOKEN=<optional write protection token>
+```
+
+## Important routes
+
+```text
+GET  /health
+GET  /debug/routes
+POST /refresh/evidence
+GET  /runs/status?brand=Nissan&market=Japan
+POST /runs/{run_id}/report-bundle
+GET  /runs/latest/report-bundle?brand=Nissan&market=Japan
+POST /portfolios
+GET  /portfolios/{portfolio_id}
+GET  /portfolios/latest?brand=Nissan&market=Japan
+```
+
+## Synthetic refresh flow
+
+`POST /refresh/evidence` with:
+
+```json
+{
+  "brand": "Nissan",
+  "market": "Japan",
+  "domain": "https://www.nissan.co.jp",
+  "query_portfolio_mode": "synthetic",
+  "query_portfolio_id": "",
+  "topic_count": 8,
+  "queries_per_topic": 6,
+  "query_limit": 50,
+  "max_owned_pages_per_query": 3,
+  "run_serpapi": false,
+  "crawl_owned": true,
+  "crawl_external": false,
+  "trigger_auditor": true
+}
+```
+
+The service returns immediately with a `target_run_id`. Poll:
+
+```text
+GET /runs/{target_run_id}/status
+GET /runs/status?brand=Nissan&market=Japan
+```
+
+The dashboard should keep using `/runs/latest/report-bundle` until a new successful report bundle is stored.

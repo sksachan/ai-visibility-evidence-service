@@ -192,17 +192,43 @@ class RefreshEvidenceRequest(BaseModel):
     brand: str = "Nissan"
     market: str = "Japan"
     domain: str | None = None
+    evidence_service_url: str | None = None
     source_run_id: str | None = None
     target_run_id: str | None = None
     mode: str = "refresh_owned_pages"
+    run_mode: str | None = None
+
+    # Query portfolio orchestration. Synthetic mode is handled by Railway evidence
+    # service through the Bodhi Brand Topic Query Builder task.
+    query_portfolio_mode: str = "reuse"
     query_portfolio_id: str | None = None
+    manual_queries_json: str | None = None
+    topics_json: str | None = None
+    seed_topics: str | None = None
+    topic_count: int = 8
+    queries_per_topic: int = 6
+    language: str = "English"
+    portfolio_goal: str | None = None
+
+    # Sitemap / mapping controls.
+    sitemap_url: str | None = None
+    sitemap_max_urls: int = 2000
     query_limit: int = 50
-    max_owned_urls: int = 20
+    max_owned_pages_per_query: int = 3
+    max_external_citations_per_query: int = 3
+    max_owned_urls: int = 60
     max_external_urls: int = 30
+
+    # Evidence execution flags owned by Railway evidence service.
     crawl_owned: bool = True
     crawl_external: bool = False
+    enable_owned_crawl: bool | None = None
+    enable_external_crawl: bool | None = None
     run_serpapi: bool = False
+    enable_serpapi: bool | None = None
     use_existing_google_ai_mode: bool = True
+    trigger_auditor: bool = True
+
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -358,57 +384,12 @@ def get_latest_query_portfolio(brand: str = Query(...), market: str = Query(...)
 @router.post("/refresh/evidence")
 def trigger_refresh_evidence(req: RefreshEvidenceRequest, x_admin_token: str | None = Header(default=None)):
     require_admin(x_admin_token)
-    target_run_id = req.target_run_id or f"evidence_{normalise_key(req.brand)}_{normalise_key(req.market)}_{now_epoch()}_{uuid.uuid4().hex[:6]}"
+    # Phase 2 orchestration lives in Railway evidence service. It can trigger the
+    # Bodhi portfolio workflow, wait for completion, ingest the portfolio, run
+    # SerpAPI/crawling, and optionally trigger the Bodhi Auditor workflow.
+    from app.refresh_orchestrator import start_phase2_refresh
 
-    status = write_run_status(target_run_id, "accepted", {
-        "brand": req.brand,
-        "market": req.market,
-        "domain": req.domain,
-        "mode": req.mode,
-        "source_run_id": req.source_run_id,
-        "query_portfolio_id": req.query_portfolio_id,
-        "request": req.model_dump(),
-    })
-
-    # Start the existing crawler job for owned/external refresh. SerpAPI collection remains
-    # owned by the evidence service, but direct SerpAPI implementation can be enabled through
-    # existing /jobs/collect-serpapi when query lists are supplied by the caller.
-    job_id = None
-    if FullRefreshRequest is not None and run_full_refresh is not None and make_job_id is not None:
-        job_id = make_job_id("refresh")
-        refresh_req = FullRefreshRequest(
-            brand=req.brand,
-            market=req.market,
-            source_run_id=req.source_run_id,
-            target_run_id=target_run_id,
-            mode=req.mode,
-            use_existing_google_ai_mode=req.use_existing_google_ai_mode,
-            run_serpapi=req.run_serpapi,
-            crawl_owned=req.crawl_owned,
-            crawl_external=req.crawl_external,
-            max_queries=req.query_limit,
-            max_owned_urls=req.max_owned_urls,
-            max_external_urls=req.max_external_urls,
-        )
-        if update_job:
-            update_job(job_id, {
-                "status": "accepted",
-                "job_id": job_id,
-                "target_run_id": target_run_id,
-                "brand": req.brand,
-                "market": req.market,
-                "created_at_epoch": now_epoch(),
-                "request": refresh_req.model_dump(),
-                "phase2_wrapper": True,
-            })
-        thread = threading.Thread(target=run_full_refresh, args=(job_id, refresh_req), daemon=True)
-        thread.start()
-        status = write_run_status(target_run_id, "running", {**status, "job_id": job_id})
-
-    return {
-        "status": "accepted",
-        "target_run_id": target_run_id,
-        "job_id": job_id,
-        "run_status": status,
-        "note": "Dashboard should keep showing latest successful report until this refresh run completes and Bodhi stores a new frontend_report_bundle.",
-    }
+    payload = req.model_dump()
+    result = start_phase2_refresh(payload)
+    result["note"] = "Dashboard should keep showing latest successful report until this refresh run completes and Bodhi stores a new frontend_report_bundle."
+    return result
