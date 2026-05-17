@@ -104,3 +104,38 @@ GET /runs/status?brand=Nissan&market=Japan
 ```
 
 The dashboard should keep using `/runs/latest/report-bundle` until a new successful report bundle is stored.
+
+## v3.4 HITL/UI-node automation
+
+Bodhi API-created runs pause at UI nodes. v3.4 now submits the first pending HITL task automatically after creating the Brand Topic Query Builder run.
+
+The HITL response uses the exact UI field labels expected by the portfolio workflow:
+
+```json
+{
+  "brand": "Nissan",
+  "market": "Japan",
+  "domain": "https://www.nissan.co.jp",
+  "evidence_service_url": "https://ai-visibility-evidence-service-production.up.railway.app",
+  "portfolio_id": "",
+  "seed_topics": "",
+  "topic_count": 8,
+  "queries_per_topic": 6,
+  "language": "English",
+  "portfolio_goal": "AI answer visibility audit query portfolio."
+}
+```
+
+Recommended env vars:
+
+```text
+BODHI_API_BASE_URL=https://sapientaiproducts.com/save
+BODHI_PAT_TOKEN=pat_<token_with_tasks_execute_tasks_read_workflows_read>
+BODHI_PORTFOLIO_TASK_ID=<Brand Topic Query Builder task id>
+BODHI_PORTFOLIO_WORKFLOW_ID=<Brand Topic Query Builder workflow id>
+BODHI_PORTFOLIO_HITL_REQUIRED=true
+BODHI_HITL_TIMEOUT_SECONDS=300
+BODHI_HITL_POLL_SECONDS=2
+```
+
+The service still ignores Bodhi `_links` and constructs API URLs from `BODHI_API_BASE_URL` to avoid the observed `/savesave/` link issue.

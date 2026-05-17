@@ -120,6 +120,23 @@ def trigger_and_wait_for_portfolio(req: dict[str, Any], target_run_id: str) -> d
         raise RuntimeError(f"Could not determine Bodhi portfolio run id from response: {str(trigger)[:500]}")
     write_run_status(target_run_id, "running", {"stage": "portfolio_generation_running", "portfolio_bodhi_run_id": bodhi_run_id})
 
+    # API-created Bodhi runs pause at the workflow UI node. Submit the UI form
+    # through HITL using the same field labels as the UI node variables.
+    write_run_status(target_run_id, "running", {"stage": "portfolio_ui_hitl_waiting", "portfolio_bodhi_run_id": bodhi_run_id})
+    hitl_required = str(os.getenv("BODHI_PORTFOLIO_HITL_REQUIRED", "true")).lower() not in {"false", "0", "no"}
+    hitl_result = client.submit_first_ui_hitl(
+        bodhi_run_id,
+        inputs,
+        timeout_seconds=int(os.getenv("BODHI_PORTFOLIO_HITL_TIMEOUT_SECONDS", os.getenv("BODHI_HITL_TIMEOUT_SECONDS", "300"))),
+        poll_seconds=int(os.getenv("BODHI_HITL_POLL_SECONDS", "2")),
+        required=hitl_required,
+    )
+    write_run_status(target_run_id, "running", {
+        "stage": "portfolio_ui_hitl_submitted" if hitl_result else "portfolio_ui_hitl_not_found",
+        "portfolio_bodhi_run_id": bodhi_run_id,
+        "portfolio_hitl_task_id": (hitl_result or {}).get("hitl_task_id"),
+    })
+
     timeout = int(os.getenv("BODHI_PORTFOLIO_TIMEOUT_SECONDS", "900"))
     poll = int(os.getenv("BODHI_POLL_SECONDS", "10"))
     client.wait_for_run(task_id, bodhi_run_id, timeout_seconds=timeout, poll_seconds=poll)
@@ -254,7 +271,19 @@ def trigger_auditor_if_configured(req: dict[str, Any], target_run_id: str, portf
     }
     trigger = client.trigger_task_run(task_id, workflow_id or None, f"Auditor - {target_run_id}", inputs)
     rid = client.extract_run_id(trigger)
-    return {"bodhi_auditor_run_id": rid, "trigger_response": trigger}
+    hitl = None
+    if rid:
+        try:
+            hitl = client.submit_first_ui_hitl(
+                rid,
+                inputs,
+                timeout_seconds=int(os.getenv("BODHI_AUDITOR_HITL_TIMEOUT_SECONDS", os.getenv("BODHI_HITL_TIMEOUT_SECONDS", "240"))),
+                poll_seconds=int(os.getenv("BODHI_HITL_POLL_SECONDS", "2")),
+                required=str(os.getenv("BODHI_AUDITOR_HITL_REQUIRED", "false")).lower() in {"true", "1", "yes"},
+            )
+        except Exception as e:
+            hitl = {"error": str(e)[:500]}
+    return {"bodhi_auditor_run_id": rid, "trigger_response": trigger, "hitl": hitl}
 
 
 def run_phase2_refresh(job_id: str, req: dict[str, Any]) -> None:
