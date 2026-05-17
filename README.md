@@ -139,3 +139,7 @@ BODHI_HITL_POLL_SECONDS=2
 ```
 
 The service still ignores Bodhi `_links` and constructs API URLs from `BODHI_API_BASE_URL` to avoid the observed `/savesave/` link issue.
+
+## v3.4.3 note
+
+This build fixes dry Phase 2 synthetic refreshes where SerpAPI and crawling are disabled. The service now materialises a Bodhi-compatible compact evidence scope from the generated query portfolio plus sitemap mapping, so `audit_context`, `evidence_scope`, `query_owned_url_mapping`, and `owned_pages_full.pages` are populated before the Auditor workflow runs.

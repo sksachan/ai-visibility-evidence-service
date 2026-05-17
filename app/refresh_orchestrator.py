@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import html
 import threading
 import time
 import uuid
@@ -184,6 +185,7 @@ def trigger_and_wait_for_portfolio(req: dict[str, Any], target_run_id: str) -> d
             payload = client.get_run_file(bodhi_run_id, src)
             portfolio = extract_query_portfolio(payload)
             if portfolio:
+                portfolio = normalise_portfolio_for_evidence(portfolio, req)
                 portfolio.setdefault("metadata", {})["bodhi_portfolio_run_id"] = bodhi_run_id
                 stored = store_portfolio(portfolio, req.get("brand", ""), req.get("market", ""), req.get("domain"))
                 write_run_status(target_run_id, "running", {
@@ -191,10 +193,30 @@ def trigger_and_wait_for_portfolio(req: dict[str, Any], target_run_id: str) -> d
                     "query_portfolio_id": stored.get("portfolio_id"),
                     "portfolio_query_count": len(stored.get("queries") or []),
                     "portfolio_topic_count": len(stored.get("topics") or []),
+                    "portfolio_source": "bodhi_run_file",
                 })
                 return stored
         except Exception as e:
             errors.append(f"{src}: {str(e)[:180]}")
+
+    # Query builder workflows may persist directly to /portfolios and not write a
+    # downloadable file to the Bodhi run directory. In that case, use the latest
+    # portfolio created for this brand/market/domain after this refresh started.
+    latest = load_latest_portfolio(req.get("brand"), req.get("market"), req.get("domain"))
+    if is_usable_portfolio(latest, min_created_at=run_started_epoch - 10):
+        latest = normalise_portfolio_for_evidence(latest or {}, req)
+        latest.setdefault("metadata", {})["bodhi_portfolio_run_id"] = bodhi_run_id
+        stored = store_portfolio(latest, req.get("brand", ""), req.get("market", ""), req.get("domain"))
+        write_run_status(target_run_id, "running", {
+            "stage": "portfolio_generation_completed",
+            "query_portfolio_id": stored.get("portfolio_id"),
+            "portfolio_query_count": len(stored.get("queries") or []),
+            "portfolio_topic_count": len(stored.get("topics") or []),
+            "portfolio_source": "evidence_service_latest_fallback",
+            "portfolio_file_errors": errors[:5],
+        })
+        return stored
+
     raise RuntimeError("Portfolio run completed but no valid portfolio was found. " + "; ".join(errors[:5]))
 
 
@@ -280,6 +302,230 @@ def map_queries_to_sitemap(portfolio: dict[str, Any], urls: list[str], max_per_q
     return mappings, deduped
 
 
+
+def clean_text_value(value: Any) -> str:
+    if value is None:
+        return ""
+    text = html.unescape(str(value))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def normalise_portfolio_for_evidence(portfolio: dict[str, Any], req: dict[str, Any]) -> dict[str, Any]:
+    """Return a portfolio shape safe for downstream compact bundle builders.
+
+    Some Bodhi/portfolio-store responses intentionally store only the useful top-level
+    fields. This normalises schema/version fields and HTML entities without changing
+    the user-facing query intent.
+    """
+    out = dict(portfolio or {})
+    out.setdefault("schema_version", "brand_topic_query_portfolio.v1")
+    out.setdefault("brand", req.get("brand"))
+    out.setdefault("market", req.get("market"))
+    out.setdefault("domain", req.get("domain"))
+    out.setdefault("portfolio_source", out.get("portfolio_source") or "synthetic_deepresearch")
+    out.setdefault("metadata", {})
+    topics = []
+    for t in out.get("topics") or []:
+        if isinstance(t, dict):
+            tt = dict(t)
+            for key in ("topic", "name", "description", "rationale"):
+                if key in tt:
+                    tt[key] = clean_text_value(tt[key])
+            topics.append(tt)
+        else:
+            topics.append({"topic": clean_text_value(t)})
+    queries = []
+    for i, q in enumerate(out.get("queries") or [], start=1):
+        if not isinstance(q, dict):
+            q = {"query": clean_text_value(q)}
+        qq = dict(q)
+        qq.setdefault("query_id", f"q{i:03d}")
+        for key in ("query", "topic", "journey_stage", "intent", "priority", "recommended_page_type", "reason_selected", "market_localisation_notes"):
+            if key in qq:
+                qq[key] = clean_text_value(qq[key])
+        queries.append(qq)
+    out["topics"] = topics
+    out["queries"] = queries
+    return out
+
+
+def fallback_owned_urls(domain: str | None) -> list[str]:
+    if not domain:
+        return []
+    base = str(domain).rstrip("/")
+    return [
+        base + "/",
+        base + "/vehicles/",
+        base + "/ev/",
+        base + "/dealers/",
+        base + "/service/",
+        base + "/purchase/",
+        base + "/afterservice/",
+        base + "/news/",
+    ]
+
+
+def materialise_phase2_evidence_files(
+    target: Path,
+    req: dict[str, Any],
+    portfolio: dict[str, Any] | None,
+    queries: list[dict[str, Any]],
+    sitemap_urls: list[str],
+    mappings: list[dict[str, Any]],
+    owned_urls: list[str],
+    portfolio_id: str | None,
+) -> None:
+    """Write Bodhi-compact compatible files even when SerpAPI/crawling is disabled.
+
+    In a dry evidence refresh, the audit still needs a query portfolio and mapped owned
+    URL candidates. Crawl and SerpAPI evidence can be empty-but-shaped, but audit_context,
+    evidence_scope and owned_pages_full must not be empty.
+    """
+    brand = req.get("brand") or ""
+    market = req.get("market") or ""
+    domain = req.get("domain") or ""
+    query_by_id = {q.get("query_id"): q for q in queries if isinstance(q, dict)}
+    mappings_by_url: dict[str, list[dict[str, Any]]] = {}
+    for m in mappings:
+        u = m.get("url")
+        if not u:
+            continue
+        mappings_by_url.setdefault(u, []).append(m)
+
+    owned_pages = []
+    for idx, url in enumerate(owned_urls, start=1):
+        rel = mappings_by_url.get(url, [])
+        related_queries = []
+        categories = []
+        for m in rel:
+            q = query_by_id.get(m.get("query_id")) or {}
+            if q.get("query"):
+                related_queries.append(q.get("query"))
+            if q.get("topic"):
+                categories.append(q.get("topic"))
+        owned_pages.append({
+            "url": url,
+            "final_url": url,
+            "rank": idx,
+            "selection_reason": "Mapped from synthetic query portfolio and sitemap inventory.",
+            "mapping_quality": "candidate" if rel else "fallback_candidate",
+            "mapping_score": max([int(m.get("mapping_score") or 0) for m in rel] or [0]),
+            "mapping_reason": "; ".join([clean_text_value(m.get("mapping_reason")) for m in rel[:3] if m.get("mapping_reason")]) or "Sitemap candidate retained for owned-page GEO mapping.",
+            "brand_topic_category": categories[0] if categories else None,
+            "related_queries_seed": related_queries[:10],
+            "crawl_status": "not_requested" if not bool(req.get("crawl_owned", req.get("enable_owned_crawl", False))) else "pending",
+            "extraction_status": "not_requested" if not bool(req.get("crawl_owned", req.get("enable_owned_crawl", False))) else "pending",
+            "geo_analysis_ready": False,
+            "content_score_policy": "metadata_only_until_crawled",
+            "title": "",
+            "description": "Owned URL candidate mapped from sitemap; crawl disabled for this refresh." if not bool(req.get("crawl_owned", req.get("enable_owned_crawl", False))) else "Owned URL candidate awaiting crawl.",
+            "metadata": {"query_count": len(rel), "query_ids": [m.get("query_id") for m in rel if m.get("query_id")]},
+            "markdown_chars": 0,
+            "raw_markdown_chars": 0,
+            "markdown": "",
+            "content_extract": "",
+            "main_text": "",
+            "text": "",
+        })
+
+    audit_context = {
+        "schema_version": "audit_context.v2",
+        "brand": brand,
+        "market": market,
+        "domain": domain,
+        "portfolio_id": portfolio_id,
+        "query_portfolio_source": (portfolio or {}).get("portfolio_source") if portfolio else req.get("query_portfolio_mode"),
+        "topics": (portfolio or {}).get("topics", []) if portfolio else [],
+        "queries": queries,
+        "pages": owned_pages,
+        "owned_urls": owned_pages,
+        "query_owned_url_mapping": mappings,
+        "counts": {"queries": len(queries), "owned_pages": len(owned_pages), "mappings": len(mappings), "sitemap_urls": len(sitemap_urls)},
+    }
+    evidence_scope = {
+        "schema_version": "evidence_scope.v2",
+        "brand": brand,
+        "market": market,
+        "domain": domain,
+        "run_id": req.get("target_run_id"),
+        "query_portfolio_id": portfolio_id,
+        "queries": queries,
+        "owned_pages": owned_pages,
+        "owned_urls": owned_pages,
+        "query_owned_url_mapping": mappings,
+        "external_sources": [],
+        "ai_citations": [],
+        "evidence_collection": {
+            "serpapi_enabled": bool(req.get("run_serpapi") or req.get("enable_serpapi")),
+            "owned_crawl_enabled": bool(req.get("crawl_owned", req.get("enable_owned_crawl", False))),
+            "external_crawl_enabled": bool(req.get("crawl_external", req.get("enable_external_crawl", False))),
+            "mode": req.get("mode") or req.get("run_mode") or "phase2_refresh",
+        },
+    }
+    google_ai_mode = {
+        "schema_version": "google_ai_mode_compact.v2",
+        "brand": brand,
+        "market": market,
+        "rows": [
+            {
+                "query_id": q.get("query_id"),
+                "query": q.get("query"),
+                "brand_topic_category": q.get("topic"),
+                "references": [],
+                "top_cited_sources": [],
+                "answer_summary": "SerpAPI collection was not run for this refresh." if not bool(req.get("run_serpapi") or req.get("enable_serpapi")) else "SerpAPI collection pending.",
+            }
+            for q in queries
+        ],
+    }
+    visibility_matrix = {
+        "schema_version": "visibility_matrix.v2",
+        "brand": brand,
+        "market": market,
+        "queries": [
+            {
+                "query_id": q.get("query_id"),
+                "query": q.get("query"),
+                "brand_topic_category": q.get("topic"),
+                "visibility_status": "not_collected" if not bool(req.get("run_serpapi") or req.get("enable_serpapi")) else "pending_collection",
+                "owned_target_page_cited": False,
+                "owned_domain_citations": 0,
+                "competitor_mentions_count": 0,
+                "citations": [],
+            }
+            for q in queries
+        ],
+    }
+    source_classification = {
+        "schema_version": "source_classification.v2",
+        "brand": brand,
+        "market": market,
+        "sources": [],
+        "source_type_counts": {},
+    }
+
+    # Do not overwrite richer crawl/SerpAPI outputs if they already exist, except for
+    # audit/evidence/mapping files which define the refresh scope.
+    write_json(target / "query_portfolio.json", portfolio or {})
+    write_json(target / "audit_context.json", audit_context)
+    write_json(target / "evidence_scope.json", evidence_scope)
+    write_json(target / "query_owned_url_mapping.json", {"run_id": req.get("target_run_id"), "query_portfolio_id": portfolio_id, "mappings": mappings, "mapped_owned_url_count": len(owned_urls)})
+    write_json(target / "google_ai_mode_compact.json", google_ai_mode)
+    if not (target / "visibility_matrix.json").exists():
+        write_json(target / "visibility_matrix.json", visibility_matrix)
+    if not (target / "source_classification.json").exists():
+        write_json(target / "source_classification.json", source_classification)
+    owned_existing = read_json(target / "owned_pages_full.json", {})
+    existing_pages = owned_existing.get("pages") if isinstance(owned_existing, dict) else None
+    if not existing_pages:
+        write_json(target / "owned_pages_full.json", {"run_id": req.get("target_run_id"), "brand": brand, "market": market, "source": "phase2_mapping_metadata", "pages": owned_pages, "summary": {"attempted": len(owned_pages), "successful": 0, "crawl_enabled": bool(req.get("crawl_owned", req.get("enable_owned_crawl", False)))}})
+    external_existing = read_json(target / "external_pages_full.json", {})
+    existing_external = (external_existing.get("external_pages") or external_existing.get("pages")) if isinstance(external_existing, dict) else None
+    if not existing_external:
+        write_json(target / "external_pages_full.json", {"run_id": req.get("target_run_id"), "brand": brand, "market": market, "source": "phase2_mapping_metadata", "external_pages": [], "pages": [], "failed_sources": [], "summary": {"attempted": 0, "successful": 0, "crawl_enabled": bool(req.get("crawl_external", req.get("enable_external_crawl", False)))}})
+
+
 def trigger_auditor_if_configured(req: dict[str, Any], target_run_id: str, portfolio_id: str | None) -> dict[str, Any] | None:
     task_id = os.getenv("BODHI_AUDITOR_TASK_ID", "")
     workflow_id = os.getenv("BODHI_AUDITOR_WORKFLOW_ID", "")
@@ -345,6 +591,7 @@ def run_phase2_refresh(job_id: str, req: dict[str, Any]) -> None:
                     portfolio = store_portfolio(parsed, req.get("brand", ""), req.get("market", ""), req.get("domain"))
                     portfolio_id = portfolio.get("portfolio_id")
         if portfolio:
+            portfolio = normalise_portfolio_for_evidence(portfolio, req)
             write_json(target / "query_portfolio.json", portfolio)
 
         queries = (portfolio or {}).get("queries") or []
@@ -354,14 +601,20 @@ def run_phase2_refresh(job_id: str, req: dict[str, Any]) -> None:
         write_run_status(target_run_id, "running", {"stage": "sitemap_inventory_running", "query_count": len(queries), "query_portfolio_id": portfolio_id})
         sitemap_url = req.get("sitemap_url")
         sitemap_urls = fetch_sitemap_urls(req.get("domain"), sitemap_url, max_urls=int(req.get("sitemap_max_urls") or 2000))
-        write_json(target / "sitemap_inventory.json", {"source": sitemap_url or (str(req.get("domain") or "").rstrip("/") + "/sitemap.xml"), "url_count": len(sitemap_urls), "urls": sitemap_urls, "generated_at_epoch": now_epoch()})
+        if not sitemap_urls:
+            sitemap_urls = fallback_owned_urls(req.get("domain"))
+        write_json(target / "sitemap_inventory.json", {"source": sitemap_url or (str(req.get("domain") or "").rstrip("/") + "/sitemap.xml"), "url_count": len(sitemap_urls), "urls": sitemap_urls, "generated_at_epoch": now_epoch(), "fallback_used": not bool(sitemap_urls)})
 
         owned_urls: list[str] = []
+        mappings: list[dict[str, Any]] = []
         if portfolio and sitemap_urls:
             write_run_status(target_run_id, "running", {"stage": "owned_url_mapping_running", "sitemap_url_count": len(sitemap_urls)})
             mappings, mapped_owned = map_queries_to_sitemap(portfolio, sitemap_urls, int(req.get("max_owned_pages_per_query") or req.get("max_owned_urls_per_query") or 3))
-            write_json(target / "query_owned_url_mapping.json", {"run_id": target_run_id, "query_portfolio_id": portfolio_id, "mappings": mappings, "mapped_owned_url_count": len(mapped_owned)})
             owned_urls = mapped_owned[: int(req.get("max_owned_urls") or 60)]
+
+        # Materialise scope before optional crawl so /bodhi-compact is useful even
+        # for no-SerpAPI/no-crawl dry refreshes.
+        materialise_phase2_evidence_files(target, {**req, "target_run_id": target_run_id}, portfolio, queries, sitemap_urls, mappings, owned_urls, portfolio_id)
 
         # Optional live SerpAPI collection owned by evidence service.
         if bool(req.get("run_serpapi") or req.get("enable_serpapi")) and queries:
@@ -391,6 +644,11 @@ def run_phase2_refresh(job_id: str, req: dict[str, Any]) -> None:
             max_external_urls=int(req.get("max_external_urls") or 30),
         )
         run_full_refresh(job_id, refresh_req)
+
+        # run_full_refresh can legitimately write empty crawl files when crawling is
+        # disabled. Re-materialise metadata scope afterwards so the Auditor can still
+        # see the portfolio, mappings and owned URL candidates.
+        materialise_phase2_evidence_files(target, {**req, "target_run_id": target_run_id}, portfolio, queries, sitemap_urls, mappings, owned_urls, portfolio_id)
 
         auditor = None
         if bool(req.get("trigger_auditor", True)):
