@@ -1,38 +1,91 @@
-# AI Visibility Evidence Service
+# AI Visibility Evidence Service v3
 
-FastAPI service for serving AI Search Visibility evidence snapshots to Bodhi.
+Railway service for AI Brand Visibility evidence storage, refresh orchestration and report-bundle retrieval.
 
-## Local run
+## Responsibility boundary
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn app.main:app --reload
-## Health check
+The evidence service owns evidence acquisition and storage:
 
-curl http://localhost:8000/health
+- SerpAPI / Google AI Mode collection
+- Sitemap / URL inventory storage
+- Owned URL crawling
+- External citation URL crawling
+- Evidence run status
+- Latest successful report bundle retrieval
+- Synthetic/manual query portfolio storage
 
-## Seed latest run
+The Bodhi Auditor workflow consumes evidence from this service, builds the canonical `frontend_report_bundle`, runs synthesis, and stores the completed report bundle back here.
 
-python scripts/seed_latest_run.py \
-  --zip /path/to/local_ai_visibility_success_run.zip \
-  --brand Nissan \
-  --market Japan \
-  --run-id nissan_japan_demo_v1 \
-  --data-dir ./data/evidence-runs
+## Key endpoints
 
+### Health
 
-## Query-workbench report-bundle API
+`GET /health`
 
-Locked orchestration strategy: `query -> top 3 owned URLs -> top 3 external citations -> winning patterns -> CMS/PR recommendations -> rerun delta -> refreshed recommendations`.
+### Latest successful report bundle
 
-New endpoints:
+`GET /runs/latest/report-bundle?brand=Nissan&market=Japan`
 
-- `POST /admin/seed-report-bundle` uploads a canonical `frontend_report_bundle.json` or zip containing it.
-- `GET /runs/{run_id}/report-bundle` returns the canonical dashboard bundle.
-- `GET /runs/latest/report-bundle?brand=Nissan&market=Japan` returns the latest bundle for a brand/market.
-- `GET /runs/{run_id}/query-workbench` returns the query workbench only.
-- `GET /runs/{run_id}/compare?baseline_run_id=...` returns query-level deltas.
+Alias:
 
-The frontend should prefer `/runs/latest/report-bundle` over compact Bodhi files once this service is connected.
+`GET /reports/latest-successful?brand=Nissan&market=Japan`
+
+These return only a completed successful report. They intentionally ignore in-progress or failed refreshes.
+
+### Store/read report bundles
+
+`POST /runs/{run_id}/report-bundle`
+
+Stores the Bodhi-produced `frontend_report_bundle.json` and marks the run successful.
+
+`GET /runs/{run_id}/report-bundle`
+
+Reads a specific report bundle.
+
+### Run status
+
+`POST /runs/{run_id}/status`
+
+`GET /runs/{run_id}/status`
+
+`GET /runs/status?brand=Nissan&market=Japan`
+
+The dashboard can poll this while continuing to display the latest successful report.
+
+### Refresh evidence
+
+`POST /refresh/evidence`
+
+Creates a new evidence refresh run and starts the existing crawler flow where possible. The dashboard should not switch report data until a new successful Bodhi report bundle is stored.
+
+### Query portfolio storage
+
+`POST /portfolios`
+
+`GET /portfolios/{portfolio_id}`
+
+`GET /portfolios/latest?brand=Nissan&market=Japan`
+
+The synthetic DeepResearch workflow should write its generated topic/query portfolio here. The Auditor workflow reads it by `query_portfolio_id`; the two Bodhi workflows do not need direct coupling.
+
+### Existing compatibility endpoints
+
+The v2 endpoints remain available, including:
+
+- `GET /runs/{run_id}/bodhi-compact`
+- `GET /runs/{run_id}/compact`
+- `POST /admin/seed-run`
+- `POST /jobs/full-refresh`
+- `POST /jobs/collect-serpapi`
+
+## Environment variables
+
+Required/recommended:
+
+```text
+DATA_DIR=/data/evidence-runs
+ADMIN_TOKEN=<server-side admin token>
+SERPAPI_KEY=<optional; only needed when SerpAPI collection is enabled>
+```
+
+Keep `SERPAPI_KEY` in Railway only. Do not pass it to Bodhi.
