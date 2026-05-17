@@ -1,0 +1,24 @@
+# Python local env / cache
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node local env / build
+node_modules/
+dist/
+build/
+.npm/
+
+# Runtime / local data
+.env
+.env.*
+!.env.example
+.DS_Store
+outputs/
+data/
+tmp/
+*.log

@@ -289,3 +289,172 @@ app.include_router(parity_safe_jobs_router)
 app.include_router(parity_parallel_jobs_router)
 
 app.include_router(bodhi_compact_router)
+
+
+# -----------------------------------------------------------------------------
+# Query-workbench report-bundle API
+# Locked orchestration: query -> top 3 owned URLs -> top 3 external citations ->
+# winning patterns -> CMS/PR recommendations -> rerun deltas.
+# -----------------------------------------------------------------------------
+
+def _bundle_latest_key(brand: str, market: str) -> str:
+    return f"{normalise_key(brand)}_{normalise_key(market)}.json"
+
+
+def _report_bundle_path(run_id: str) -> Path:
+    return DATA_DIR / run_id / "frontend_report_bundle.json"
+
+
+def _read_report_bundle(run_id: str):
+    path = _report_bundle_path(run_id)
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _write_report_bundle(bundle: dict, run_id: str, brand: str, market: str):
+    run_dir = DATA_DIR / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    bundle.setdefault("run_id", run_id)
+    bundle.setdefault("brand", brand)
+    bundle.setdefault("market", market)
+    bundle.setdefault("schema_version", "query_workbench.v1")
+    (_report_bundle_path(run_id)).write_text(json.dumps(bundle, ensure_ascii=False, indent=2), encoding="utf-8")
+    manifest = {
+        "run_id": run_id,
+        "brand": brand,
+        "market": market,
+        "status": "ready",
+        "report_bundle": str(_report_bundle_path(run_id)),
+        "schema_version": bundle.get("schema_version"),
+        "query_count": len(bundle.get("query_workbench") or []),
+    }
+    (run_dir / "report_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    latest_dir = DATA_DIR / "latest_report_bundles"
+    latest_dir.mkdir(parents=True, exist_ok=True)
+    (latest_dir / _bundle_latest_key(brand, market)).write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return manifest
+
+
+def _find_json_in_extracted(root: Path, names: list[str]) -> Optional[Path]:
+    for name in names:
+        direct = root / name
+        if direct.exists():
+            return direct
+    for p in root.rglob("*.json"):
+        if p.name in {Path(n).name for n in names}:
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and ("query_workbench" in data or "frontend_report_bundle" in data):
+                    return p
+            except Exception:
+                pass
+    return None
+
+
+@app.post("/admin/seed-report-bundle")
+async def seed_report_bundle(
+    file: UploadFile = File(...),
+    brand: str = Form("Nissan"),
+    market: str = Form("Japan"),
+    run_id: str = Form(""),
+    x_admin_token: Optional[str] = Header(None)
+):
+    if ADMIN_SEED_TOKEN and x_admin_token != ADMIN_SEED_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid admin token")
+    run_id = run_id or f"{normalise_key(brand)}_{normalise_key(market)}_report_bundle"
+    upload_dir = DATA_DIR / "_report_uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    suffix = Path(file.filename or "upload.json").suffix.lower()
+    upload_path = upload_dir / f"{run_id}{suffix or '.json'}"
+    with upload_path.open("wb") as f:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            f.write(chunk)
+    tmp_dir = upload_dir / f"{run_id}_extract"
+    try:
+        if suffix == ".zip":
+            if tmp_dir.exists():
+                shutil.rmtree(tmp_dir)
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(upload_path, "r") as zf:
+                zf.extractall(tmp_dir)
+            json_path = _find_json_in_extracted(tmp_dir, ["outputs/frontend_report_bundle.json", "frontend_report_bundle.json", "preview_node_bundle.json"])
+            if not json_path:
+                raise HTTPException(status_code=400, detail="No frontend_report_bundle.json found in zip")
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+        else:
+            payload = json.loads(upload_path.read_text(encoding="utf-8"))
+        bundle = payload.get("frontend_report_bundle") if isinstance(payload, dict) and isinstance(payload.get("frontend_report_bundle"), dict) else payload
+        if not isinstance(bundle, dict) or not isinstance(bundle.get("query_workbench"), list):
+            raise HTTPException(status_code=400, detail="Report bundle must contain query_workbench[]")
+        manifest = _write_report_bundle(bundle, run_id=run_id, brand=brand, market=market)
+        return {"status": "seeded", "manifest": manifest}
+    finally:
+        upload_path.unlink(missing_ok=True)
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@app.get("/runs/{run_id}/report-bundle")
+def get_report_bundle(run_id: str):
+    bundle = _read_report_bundle(run_id)
+    if bundle is None:
+        raise HTTPException(status_code=404, detail="No frontend report bundle found for this run_id")
+    return bundle
+
+
+@app.get("/runs/latest/report-bundle")
+def get_latest_report_bundle(brand: str, market: str):
+    manifest_path = DATA_DIR / "latest_report_bundles" / _bundle_latest_key(brand, market)
+    if not manifest_path.exists():
+        raise HTTPException(status_code=404, detail="No latest report bundle found for this brand/market")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    bundle = _read_report_bundle(manifest["run_id"])
+    if bundle is None:
+        raise HTTPException(status_code=404, detail="Latest report manifest exists but bundle is missing")
+    return bundle
+
+
+@app.get("/runs/{run_id}/query-workbench")
+def get_query_workbench(run_id: str):
+    bundle = _read_report_bundle(run_id)
+    if bundle is None:
+        raise HTTPException(status_code=404, detail="No frontend report bundle found for this run_id")
+    return {"run_id": run_id, "query_workbench": bundle.get("query_workbench", [])}
+
+
+@app.get("/runs/{run_id}/history")
+def get_run_history(run_id: str):
+    bundle = _read_report_bundle(run_id)
+    if bundle is None:
+        raise HTTPException(status_code=404, detail="No frontend report bundle found for this run_id")
+    return {"run_id": run_id, "history": bundle.get("run_history", [])}
+
+
+@app.get("/runs/{run_id}/compare")
+def compare_runs(run_id: str, baseline_run_id: str):
+    current = _read_report_bundle(run_id)
+    baseline = _read_report_bundle(baseline_run_id)
+    if current is None or baseline is None:
+        raise HTTPException(status_code=404, detail="Both current and baseline report bundles are required")
+    base_by_q = {q.get("query_id"): q for q in baseline.get("query_workbench", [])}
+    deltas = []
+    for q in current.get("query_workbench", []):
+        b = base_by_q.get(q.get("query_id"))
+        if not b:
+            continue
+        cur_vis = (q.get("current_ai_visibility") or {}).get("score", 0)
+        base_vis = (b.get("current_ai_visibility") or {}).get("score", 0)
+        cur_citations = [c.get("url") for c in (q.get("current_ai_visibility") or {}).get("top_citations", [])]
+        base_citations = [c.get("url") for c in (b.get("current_ai_visibility") or {}).get("top_citations", [])]
+        deltas.append({
+            "query_id": q.get("query_id"),
+            "query": q.get("query"),
+            "visibility_score_delta": cur_vis - base_vis,
+            "new_top_citations": [u for u in cur_citations[:3] if u and u not in base_citations[:3]],
+            "owned_target_citation_changed": (q.get("current_ai_visibility") or {}).get("owned_target_cited") != (b.get("current_ai_visibility") or {}).get("owned_target_cited"),
+        })
+    return {"baseline_run_id": baseline_run_id, "run_id": run_id, "deltas": deltas}
