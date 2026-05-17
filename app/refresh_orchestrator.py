@@ -43,6 +43,29 @@ def read_json(path: Path, default: Any = None) -> Any:
         return default
 
 
+def redact_sensitive(value: Any) -> Any:
+    """Remove access tokens and other credentials before writing status files."""
+    sensitive_keys = {"access_token", "authorization", "auth", "token", "pat", "pat_token", "api_key", "secret", "password"}
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            lk = str(k).lower()
+            if lk in sensitive_keys or lk.endswith("_token") or "access_token" in lk:
+                out[k] = "[REDACTED]"
+            elif lk == "exec_metadata" and isinstance(v, dict):
+                red = redact_sensitive(v)
+                if isinstance(red, dict):
+                    out[k] = red
+                else:
+                    out[k] = "[REDACTED]"
+            else:
+                out[k] = redact_sensitive(v)
+        return out
+    if isinstance(value, list):
+        return [redact_sensitive(x) for x in value]
+    return value
+
+
 def status_dir() -> Path:
     return DATA_DIR / "run_status"
 
@@ -57,7 +80,7 @@ def portfolio_dir() -> Path:
 
 def write_run_status(run_id: str, status: str, patch: dict[str, Any] | None = None) -> dict[str, Any]:
     current = read_json(status_dir() / f"{run_id}.json", {}) or {}
-    current.update(patch or {})
+    current.update(redact_sensitive(patch or {}))
     current["run_id"] = run_id
     current["status"] = status
     current["updated_at_epoch"] = now_epoch()
@@ -530,10 +553,13 @@ def trigger_auditor_if_configured(req: dict[str, Any], target_run_id: str, portf
     task_id = os.getenv("BODHI_AUDITOR_TASK_ID", "")
     workflow_id = os.getenv("BODHI_AUDITOR_WORKFLOW_ID", "")
     if not task_id:
+        write_run_status(target_run_id, "running", {"stage": "auditor_skipped", "auditor_skip_reason": "BODHI_AUDITOR_TASK_ID not set"})
         return None
     client = BodhiClient()
     if not client.enabled:
+        write_run_status(target_run_id, "running", {"stage": "auditor_skipped", "auditor_skip_reason": "BODHI_PAT_TOKEN not set"})
         return None
+    max_external = req.get("max_external_sources_per_query") or req.get("max_external_citations_per_query") or 3
     inputs = {
         "brand": req.get("brand"),
         "market": req.get("market"),
@@ -544,14 +570,19 @@ def trigger_auditor_if_configured(req: dict[str, Any], target_run_id: str, portf
         "query_portfolio_mode": req.get("query_portfolio_mode") or "reuse",
         "query_portfolio_id": portfolio_id or "",
         "max_owned_pages_per_query": req.get("max_owned_pages_per_query") or req.get("max_owned_urls_per_query") or 3,
-        "max_external_citations_per_query": req.get("max_external_citations_per_query") or 3,
+        # Keep both names for compatibility with older evidence payloads and the v9.2 UI field.
+        "max_external_sources_per_query": max_external,
+        "max_external_citations_per_query": max_external,
         "query_limit": req.get("query_limit") or 50,
     }
+    write_run_status(target_run_id, "running", {"stage": "auditor_queued", "auditor_task_id": task_id})
     trigger = client.trigger_task_run(task_id, workflow_id or None, f"Auditor - {target_run_id}", inputs)
     rid = client.extract_run_id(trigger)
+    write_run_status(target_run_id, "running", {"stage": "auditor_run_created", "bodhi_auditor_run_id": rid, "trigger_response": trigger})
     hitl = None
     if rid:
         try:
+            write_run_status(target_run_id, "running", {"stage": "auditor_ui_hitl_waiting", "bodhi_auditor_run_id": rid})
             hitl = client.submit_first_ui_hitl(
                 rid,
                 inputs,
@@ -559,8 +590,16 @@ def trigger_auditor_if_configured(req: dict[str, Any], target_run_id: str, portf
                 poll_seconds=int(os.getenv("BODHI_HITL_POLL_SECONDS", "2")),
                 required=str(os.getenv("BODHI_AUDITOR_HITL_REQUIRED", "false")).lower() in {"true", "1", "yes"},
             )
+            write_run_status(target_run_id, "running", {
+                "stage": "auditor_ui_hitl_submitted" if hitl else "auditor_ui_hitl_not_found",
+                "bodhi_auditor_run_id": rid,
+                "auditor_hitl_task_id": (hitl or {}).get("hitl_task_id"),
+                "hitl": hitl,
+            })
         except Exception as e:
             hitl = {"error": str(e)[:500]}
+            write_run_status(target_run_id, "running", {"stage": "auditor_ui_hitl_failed", "bodhi_auditor_run_id": rid, "auditor_error": str(e)[:500]})
+    write_run_status(target_run_id, "running", {"stage": "auditor_running", "bodhi_auditor_run_id": rid})
     return {"bodhi_auditor_run_id": rid, "trigger_response": trigger, "hitl": hitl}
 
 
@@ -652,16 +691,21 @@ def run_phase2_refresh(job_id: str, req: dict[str, Any]) -> None:
 
         auditor = None
         if bool(req.get("trigger_auditor", True)):
-            write_run_status(target_run_id, "running", {"stage": "auditor_queued"})
             try:
                 auditor = trigger_auditor_if_configured(req, target_run_id, portfolio_id)
-                if auditor:
-                    write_run_status(target_run_id, "running", {"stage": "auditor_running", **auditor})
             except Exception as e:
                 write_run_status(target_run_id, "running", {"stage": "auditor_trigger_failed", "auditor_error": str(e)[:500]})
-
-        write_run_status(target_run_id, "completed", {"stage": "evidence_ready", "query_portfolio_id": portfolio_id, "auditor": auditor, "completed_at_epoch": now_epoch()})
-        update_job(job_id, {"status": "completed", "stage": "evidence_ready", "target_run_id": target_run_id, "completed_at_epoch": now_epoch()})
+            if auditor:
+                # The Auditor workflow stores /runs/{run_id}/report-bundle when it finishes.
+                # Keep the refresh run active until report_store marks it report_bundle_ready.
+                write_run_status(target_run_id, "running", {"stage": "auditor_running", "query_portfolio_id": portfolio_id, "auditor": auditor})
+                update_job(job_id, {"status": "running", "stage": "auditor_running", "target_run_id": target_run_id, "updated_at_epoch": now_epoch()})
+            else:
+                write_run_status(target_run_id, "completed", {"stage": "evidence_ready", "query_portfolio_id": portfolio_id, "completed_at_epoch": now_epoch()})
+                update_job(job_id, {"status": "completed", "stage": "evidence_ready", "target_run_id": target_run_id, "completed_at_epoch": now_epoch()})
+        else:
+            write_run_status(target_run_id, "completed", {"stage": "evidence_ready", "query_portfolio_id": portfolio_id, "completed_at_epoch": now_epoch()})
+            update_job(job_id, {"status": "completed", "stage": "evidence_ready", "target_run_id": target_run_id, "completed_at_epoch": now_epoch()})
     except Exception as e:
         write_run_status(target_run_id, "failed", {"stage": "failed", "error": str(e)[:1500], "failed_at_epoch": now_epoch()})
         update_job(job_id, {"status": "failed", "stage": "failed", "error": str(e)[:1500], "failed_at_epoch": now_epoch()})

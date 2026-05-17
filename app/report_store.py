@@ -63,6 +63,22 @@ def write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def redact_sensitive(value: Any) -> Any:
+    sensitive_keys = {"access_token", "authorization", "auth", "token", "pat", "pat_token", "api_key", "secret", "password"}
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            lk = str(k).lower()
+            if lk in sensitive_keys or lk.endswith("_token") or "access_token" in lk:
+                out[k] = "[REDACTED]"
+            else:
+                out[k] = redact_sensitive(v)
+        return out
+    if isinstance(value, list):
+        return [redact_sensitive(x) for x in value]
+    return value
+
+
 def run_dir(run_id: str) -> Path:
     return DATA_DIR / run_id
 
@@ -110,7 +126,7 @@ def update_latest_successful_index(manifest: dict[str, Any]) -> None:
 
 def write_run_status(run_id: str, status: str, patch: dict[str, Any] | None = None) -> dict[str, Any]:
     current = read_json(status_dir() / f"{run_id}.json", {}) or {}
-    current.update(patch or {})
+    current.update(redact_sensitive(patch or {}))
     current["run_id"] = run_id
     current["status"] = status
     current["updated_at_epoch"] = now_epoch()
@@ -252,6 +268,7 @@ async def store_report_bundle(run_id: str, request: Request, x_admin_token: str 
     meta = extract_bundle_metadata(bundle, fallback_run_id=run_id)
     manifest = {
         "status": "completed",
+        "stage": "report_bundle_ready",
         "run_id": run_id,
         "brand": meta.get("brand"),
         "market": meta.get("market"),
