@@ -89,3 +89,19 @@ SERPAPI_KEY=<optional; only needed when SerpAPI collection is enabled>
 ```
 
 Keep `SERPAPI_KEY` in Railway only. Do not pass it to Bodhi.
+
+## Railway start command
+
+Use this exact start command if Railway UI asks for one:
+
+```bash
+./start.sh
+```
+
+Alternative:
+
+```bash
+python -m uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8080}
+```
+
+Do not use `--port '$PORT'`; the single quotes prevent Railway from expanding the variable and uvicorn receives the literal string `$PORT`.

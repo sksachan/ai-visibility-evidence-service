@@ -20,5 +20,7 @@ RUN python -m playwright install --with-deps chromium
 
 COPY app ./app
 COPY scripts ./scripts
+COPY start.sh ./start.sh
+RUN chmod +x ./start.sh
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["./start.sh"]
