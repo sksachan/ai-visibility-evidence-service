@@ -307,7 +307,7 @@ def discover_sitemap_candidates(domain: str | None, explicit_sitemap_url: str | 
     errors: list[str] = []
     robots_url = ""
     robots_status = "not_checked"
-    headers = {"User-Agent": "ai-visibility-evidence-service/3.5.2"}
+    headers = {"User-Agent": "ai-visibility-evidence-service/3.5.2.2"}
     base = str(domain or "").strip().rstrip("/")
     if explicit_sitemap_url:
         candidates.append(str(explicit_sitemap_url).strip())
@@ -325,8 +325,18 @@ def discover_sitemap_candidates(domain: str | None, explicit_sitemap_url: str | 
         except Exception as exc:
             robots_status = "error"
             errors.append(f"robots.txt: {exc}")
-        for path in ["/sitemap.xml", "/sitemap_index.xml", "/sitemap-index.xml", "/sitemap/sitemap.xml", "/index.pages-sitemap.xml"]:
-            candidates.append(base + path)
+        common_paths = ["/sitemap.xml", "/sitemap_index.xml", "/sitemap-index.xml", "/sitemap/sitemap.xml", "/index.pages-sitemap.xml"]
+        bases = [base]
+        try:
+            parsed = urlparse(base)
+            if parsed.scheme and parsed.netloc.startswith("www."):
+                suffix = parsed.netloc[4:]
+                bases.extend([f"{parsed.scheme}://www3.{suffix}", f"{parsed.scheme}://www2.{suffix}"])
+        except Exception:
+            pass
+        for b in bases:
+            for path in common_paths:
+                candidates.append(b + path)
     # dedupe
     out=[]; seen=set()
     for c in candidates:
@@ -341,7 +351,7 @@ def fetch_sitemap_urls(domain: str | None, sitemap_url: str | None, max_urls: in
     urls: list[str] = []
     sitemaps_fetched: list[dict[str, Any]] = []
     to_fetch = list(discovery.get("candidates") or [])
-    headers = {"User-Agent": "ai-visibility-evidence-service/3.5.2"}
+    headers = {"User-Agent": "ai-visibility-evidence-service/3.5.2.2"}
     while to_fetch and len(urls) < max_urls:
         current = to_fetch.pop(0)
         if current in seen:
@@ -375,7 +385,7 @@ def fetch_sitemap_urls(domain: str | None, sitemap_url: str | None, max_urls: in
 
 
 def check_site_ai_hygiene(domain: str | None, owned_pages: list[dict[str, Any]], discovery: dict[str, Any] | None = None) -> dict[str, Any]:
-    headers = {"User-Agent": "ai-visibility-evidence-service/3.5.2"}
+    headers = {"User-Agent": "ai-visibility-evidence-service/3.5.2.2"}
 
     def base_candidates() -> list[str]:
         values: list[str] = []
@@ -391,17 +401,32 @@ def check_site_ai_hygiene(domain: str | None, owned_pages: list[dict[str, Any]],
             except Exception:
                 return
         add(domain)
+        # Some large OEM sites expose the meaningful product estate on a sibling
+        # crawl subdomain such as www3.*, while the user-facing domain is www.*.
+        # Try conservative wwwN variants so robots/llms detection is aligned with
+        # sitemap and owned-page hosts instead of only the primary marketing host.
+        try:
+            parsed_domain = urlparse(str(domain or ""))
+            if parsed_domain.scheme and parsed_domain.netloc.startswith("www."):
+                suffix = parsed_domain.netloc[4:]
+                for prefix in ["www3", "www2"]:
+                    add(f"{parsed_domain.scheme}://{prefix}.{suffix}")
+        except Exception:
+            pass
         if discovery:
-            for key in ["robots_url", "discovered_sitemaps", "candidates"]:
+            for key in ["robots_url", "discovered_sitemaps", "candidates", "sitemaps_fetched"]:
                 v = discovery.get(key)
                 if isinstance(v, list):
                     for item in v:
-                        add(item)
+                        if isinstance(item, dict):
+                            add(item.get("url"))
+                        else:
+                            add(item)
                 else:
                     add(v)
         for page in owned_pages:
             if isinstance(page, dict):
-                add(page.get("resolved_url") or page.get("final_url") or page.get("url"))
+                add(page.get("resolved_url") or page.get("final_url") or page.get("url") or page.get("source_url"))
         return values
 
     def fetch_status(path: str) -> dict[str, Any]:
