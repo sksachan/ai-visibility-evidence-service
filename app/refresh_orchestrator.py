@@ -182,6 +182,29 @@ def is_usable_portfolio(portfolio: dict[str, Any] | None, min_created_at: int | 
     return True
 
 
+
+
+def is_full_refresh_request(req: dict[str, Any]) -> bool:
+    raw = " ".join(str(req.get(k) or "") for k in ("mode", "run_mode")).lower()
+    return "full" in raw and "refresh" in raw
+
+
+def effective_max_owned_urls(req: dict[str, Any], fallback: int = 60) -> int:
+    """Return the owned URL cap, upgrading full-refresh defaults to 100.
+
+    Frontend v23.x may not expose max_owned_urls yet and older request models
+    default to 60. For full audits, a 60 URL cap is too low versus the intended
+    100 owned URLs audited. If the caller explicitly sends >0, respect it, except
+    that full refresh upgrades the legacy 60 default to 100.
+    """
+    try:
+        value = int(req.get("max_owned_urls") or fallback)
+    except Exception:
+        value = fallback
+    if is_full_refresh_request(req) and value <= 60:
+        return 100
+    return max(0, value)
+
 def trigger_and_wait_for_portfolio(req: dict[str, Any], target_run_id: str) -> dict[str, Any]:
     run_started_epoch = now_epoch()
     task_id = os.getenv("BODHI_PORTFOLIO_TASK_ID", "")
@@ -192,6 +215,11 @@ def trigger_and_wait_for_portfolio(req: dict[str, Any], target_run_id: str) -> d
     if not client.enabled:
         raise RuntimeError("BODHI_PAT_TOKEN is not set. Cannot trigger Bodhi portfolio task.")
 
+    # v3.5.2.3: submit every UI-node field expected by Brand Topic Query
+    # Portfolio Builder v1.2. API-created Bodhi runs pause at the UI node; relying
+    # on UI defaults is brittle because HITL submissions can replace, rather than
+    # merge with, form defaults. Keep these settings backend-managed unless the
+    # frontend explicitly sends overrides.
     inputs = {
         "brand": req.get("brand"),
         "market": req.get("market"),
@@ -203,6 +231,14 @@ def trigger_and_wait_for_portfolio(req: dict[str, Any], target_run_id: str) -> d
         "queries_per_topic": req.get("queries_per_topic") or 6,
         "language": req.get("language") or "English",
         "portfolio_goal": req.get("portfolio_goal") or "AI answer visibility audit query portfolio.",
+        "planner_model": req.get("planner_model") or os.getenv("BODHI_DEEPRESEARCH_PLANNER_MODEL", "gpt-5.2"),
+        "writer_model": req.get("writer_model") or os.getenv("BODHI_DEEPRESEARCH_WRITER_MODEL", "gpt-5.2"),
+        "search_api": req.get("search_api") or os.getenv("BODHI_DEEPRESEARCH_SEARCH_API", "google"),
+        "number_of_queries": req.get("number_of_queries") or req.get("deepresearch_number_of_queries") or int(os.getenv("BODHI_DEEPRESEARCH_NUMBER_OF_QUERIES", "4")),
+        "max_search_depth": req.get("max_search_depth") or req.get("deepresearch_max_search_depth") or int(os.getenv("BODHI_DEEPRESEARCH_MAX_SEARCH_DEPTH", "2")),
+        "url_mode": req.get("url_mode") or os.getenv("BODHI_DEEPRESEARCH_URL_MODE", "domain"),
+        # The UI node declares this as text, not boolean. Keep string value for HITL compatibility.
+        "human_feedback": str(req.get("human_feedback", os.getenv("BODHI_DEEPRESEARCH_HUMAN_FEEDBACK", "false"))).lower(),
     }
     write_run_status(target_run_id, "running", {"stage": "portfolio_generation_queued", "portfolio_task_id": task_id})
     trigger = client.trigger_task_run(
@@ -1134,7 +1170,7 @@ def run_phase2_refresh(job_id: str, req: dict[str, Any]) -> None:
         if portfolio and sitemap_urls:
             write_run_status(target_run_id, "running", {"stage": "owned_url_mapping_running", "sitemap_url_count": len(sitemap_urls)})
             mappings, mapped_owned = map_queries_to_sitemap(portfolio, sitemap_urls, int(req.get("max_owned_pages_per_query") or req.get("max_owned_urls_per_query") or 3))
-            owned_urls = mapped_owned[: int(req.get("max_owned_urls") or 60)]
+            owned_urls = mapped_owned[: effective_max_owned_urls(req, 60)]
 
         # Materialise scope before optional crawl so /bodhi-compact is useful even
         # for no-SerpAPI/no-crawl dry refreshes.
@@ -1175,7 +1211,7 @@ def run_phase2_refresh(job_id: str, req: dict[str, Any]) -> None:
             crawl_owned=bool(req.get("crawl_owned", req.get("enable_owned_crawl", True))),
             crawl_external=bool(req.get("crawl_external", req.get("enable_external_crawl", False))),
             max_queries=query_limit,
-            max_owned_urls=int(req.get("max_owned_urls") or max(20, len(owned_urls) or 20)),
+            max_owned_urls=effective_max_owned_urls(req, max(20, len(owned_urls) or 20)),
             max_external_urls=int(req.get("max_external_urls") or 30),
         )
         run_full_refresh(job_id, refresh_req)

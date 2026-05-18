@@ -362,6 +362,16 @@ class RefreshEvidenceRequest(BaseModel):
     language: str = "English"
     portfolio_goal: str | None = None
 
+    # Optional Bodhi DeepResearch controls for Brand Topic Query Portfolio Builder v1.2.
+    # These are backend-managed by default but can be overridden by API callers.
+    planner_model: str | None = None
+    writer_model: str | None = None
+    search_api: str | None = None
+    number_of_queries: int | None = None
+    max_search_depth: int | None = None
+    url_mode: str | None = None
+    human_feedback: str | bool | None = None
+
     # Sitemap / mapping controls.
     sitemap_url: str | None = None
     sitemap_max_urls: int = 2000
