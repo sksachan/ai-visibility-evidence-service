@@ -143,3 +143,25 @@ The service still ignores Bodhi `_links` and constructs API URLs from `BODHI_API
 ## v3.4.3 note
 
 This build fixes dry Phase 2 synthetic refreshes where SerpAPI and crawling are disabled. The service now materialises a Bodhi-compatible compact evidence scope from the generated query portfolio plus sitemap mapping, so `audit_context`, `evidence_scope`, `query_owned_url_mapping`, and `owned_pages_full.pages` are populated before the Auditor workflow runs.
+
+
+## v3.4.5 - SerpAPI ingestion fix
+
+This patch fixes the Phase 2 path where live SerpAPI Google AI Mode calls were executed but `google_ai_mode_compact.json` still contained `SerpAPI collection pending` placeholder rows.
+
+Changes:
+- Normalises SerpAPI raw responses into `google_ai_mode_compact.rows`.
+- Extracts answer summaries and top citation URLs where SerpAPI returns them.
+- Writes `serpapi_completed_with_citations` or `serpapi_completed_no_citations` instead of leaving pending rows.
+- Merges citation URLs into `evidence_scope`, `visibility_matrix`, `source_classification`, and citation-metadata `external_pages_full`.
+- Re-merges SerpAPI evidence after crawl/full-refresh so placeholders cannot overwrite live results.
+- Ensures Auditor is triggered only after SerpAPI normalisation has completed.
+
+Smoke test after deploy:
+```bash
+curl -X POST "$EVIDENCE_SERVICE_URL/refresh/evidence" \
+  -H "Content-Type: application/json" \
+  -d '{"brand":"Nissan","market":"Japan","domain":"https://www.nissan.co.jp","query_portfolio_mode":"synthetic","topic_count":2,"queries_per_topic":2,"query_limit":2,"max_owned_pages_per_query":3,"max_external_citations_per_query":3,"run_serpapi":true,"crawl_owned":false,"crawl_external":false,"trigger_auditor":false}'
+```
+
+Then inspect `/runs/<run_id>/bodhi-compact`; `google_ai_mode_compact.rows[].answer_summary` must no longer say `SerpAPI collection pending.`

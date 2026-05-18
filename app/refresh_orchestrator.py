@@ -389,6 +389,184 @@ def fallback_owned_urls(domain: str | None) -> list[str]:
     ]
 
 
+
+def source_domain(url: Any) -> str:
+    try:
+        return urlparse(str(url or "")).netloc.lower().replace("www.", "")
+    except Exception:
+        return ""
+
+
+def normalise_serpapi_compact_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Make SerpAPI output compatible with the Auditor contract.
+
+    Older service versions wrote google_ai_mode_compact.queries with raw_response only.
+    v3.4.5 guarantees rows/top_citations/status so Bodhi never sees stale
+    "collection pending" placeholders after SerpAPI has actually run.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    rows = payload.get("rows") or payload.get("queries") or []
+    if not isinstance(rows, list):
+        rows = []
+    norm_rows: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        rr = dict(row)
+        refs = rr.get("top_citations") or rr.get("top_cited_sources") or rr.get("references") or rr.get("citations") or []
+        if not isinstance(refs, list):
+            refs = []
+        clean_refs = []
+        seen = set()
+        for i, ref in enumerate(refs, start=1):
+            if isinstance(ref, str):
+                ref = {"url": ref, "source_url": ref}
+            if not isinstance(ref, dict):
+                continue
+            url = ref.get("url") or ref.get("source_url") or ref.get("link")
+            if not isinstance(url, str) or not url.startswith(("http://", "https://")) or url in seen:
+                continue
+            seen.add(url)
+            clean_refs.append({
+                "rank": ref.get("rank") or i,
+                "title": clean_text_value(ref.get("title") or ref.get("source_name") or source_domain(url)),
+                "url": url,
+                "source_url": url,
+                "source_domain": ref.get("source_domain") or source_domain(url),
+                "source_name": clean_text_value(ref.get("source_name") or ref.get("source") or source_domain(url)),
+                "snippet": clean_text_value(ref.get("snippet") or ref.get("description") or ref.get("text")),
+                "source_type": ref.get("source_type") or "external_citation",
+            })
+        summary = clean_text_value(rr.get("answer_summary") or rr.get("summary") or rr.get("answer"))
+        if not summary or summary == "SerpAPI collection pending.":
+            summary = "SerpAPI completed but no AI answer summary was returned." if not clean_refs else "SerpAPI completed; citation references were returned."
+        status = rr.get("status")
+        if not status or str(status).startswith("pending"):
+            status = "serpapi_completed_with_citations" if clean_refs else "serpapi_completed_no_citations"
+        rr.update({
+            "answer_summary": summary,
+            "references": clean_refs,
+            "top_citations": clean_refs[:3],
+            "top_cited_sources": clean_refs[:3],
+            "citation_count": len(clean_refs),
+            "status": status,
+        })
+        norm_rows.append(rr)
+    out = dict(payload)
+    out.setdefault("schema_version", "google_ai_mode_compact.v2")
+    out["rows"] = norm_rows
+    out["queries"] = norm_rows
+    out.setdefault("summary", {})
+    if isinstance(out["summary"], dict):
+        out["summary"].update({
+            "captured_queries": len(norm_rows),
+            "queries_with_citations": sum(1 for r in norm_rows if int(r.get("citation_count") or 0) > 0),
+            "total_citations": sum(int(r.get("citation_count") or 0) for r in norm_rows),
+            "normalised_by": "evidence_service_v3.4.5",
+        })
+    return out
+
+
+def merge_serpapi_into_phase_files(target: Path, req: dict[str, Any]) -> None:
+    google_path = target / "google_ai_mode_compact.json"
+    google = normalise_serpapi_compact_payload(read_json(google_path, {}) or {})
+    rows = google.get("rows") if isinstance(google, dict) else []
+    if not isinstance(rows, list) or not rows:
+        return
+    write_json(google_path, google)
+
+    citation_records: list[dict[str, Any]] = []
+    source_by_url: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        qid = row.get("query_id")
+        qtext = row.get("query")
+        for ref in row.get("top_citations") or []:
+            url = ref.get("url") or ref.get("source_url")
+            if not url:
+                continue
+            rec = {**ref, "query_id": qid, "query": qtext, "citation_position": ref.get("rank"), "source_type": ref.get("source_type") or "external_citation"}
+            citation_records.append(rec)
+            source_by_url.setdefault(url, {**ref, "url": url, "source_url": url, "source_domain": ref.get("source_domain") or source_domain(url), "citation_count": 0, "queries": []})
+            source_by_url[url]["citation_count"] = int(source_by_url[url].get("citation_count") or 0) + 1
+            source_by_url[url].setdefault("queries", []).append(qid)
+
+    evidence = read_json(target / "evidence_scope.json", {}) or {}
+    if isinstance(evidence, dict):
+        evidence["ai_citations"] = citation_records
+        evidence["external_sources"] = list(source_by_url.values())
+        evidence["external_citation_urls"] = list(source_by_url.keys())
+        evidence.setdefault("evidence_collection", {})
+        if isinstance(evidence["evidence_collection"], dict):
+            evidence["evidence_collection"].update({
+                "serpapi_enabled": True,
+                "serpapi_status": "completed_with_citations" if citation_records else "completed_no_citations",
+                "serpapi_rows": len(rows),
+                "serpapi_citation_count": len(citation_records),
+            })
+        write_json(target / "evidence_scope.json", evidence)
+
+    visibility = read_json(target / "visibility_matrix.json", {}) or {}
+    if isinstance(visibility, dict) and isinstance(visibility.get("queries"), list):
+        cites_by_q: dict[str, list[dict[str, Any]]] = {}
+        for rec in citation_records:
+            cites_by_q.setdefault(str(rec.get("query_id")), []).append(rec)
+        for q in visibility["queries"]:
+            if not isinstance(q, dict):
+                continue
+            qid = str(q.get("query_id"))
+            cites = cites_by_q.get(qid, [])
+            q["citations"] = cites
+            q["top_citations"] = cites[:3]
+            q["visibility_status"] = "serpapi_collected_with_citations" if cites else "serpapi_collected_no_citations"
+            q["citation_count"] = len(cites)
+        write_json(target / "visibility_matrix.json", visibility)
+
+    source_type_counts: dict[str, int] = {}
+    for src in source_by_url.values():
+        st = src.get("source_type") or "external_citation"
+        source_type_counts[st] = source_type_counts.get(st, 0) + 1
+    write_json(target / "source_classification.json", {
+        "schema_version": "source_classification.v2",
+        "brand": req.get("brand"),
+        "market": req.get("market"),
+        "sources": list(source_by_url.values()),
+        "source_type_counts": source_type_counts,
+        "source": "serpapi_live_normalised",
+    })
+
+    external_existing = read_json(target / "external_pages_full.json", {}) or {}
+    existing_pages = external_existing.get("pages") or external_existing.get("external_pages") or []
+    if not existing_pages and source_by_url:
+        pages = []
+        for idx, src in enumerate(source_by_url.values(), start=1):
+            pages.append({
+                "url": src.get("url"),
+                "source_url": src.get("url"),
+                "source_domain": src.get("source_domain"),
+                "source_name": src.get("source_name"),
+                "source_type": src.get("source_type") or "external_citation",
+                "title": src.get("title"),
+                "snippet": src.get("snippet"),
+                "citation_count": src.get("citation_count"),
+                "citation_position": idx,
+                "related_queries_seed": src.get("queries", []),
+                "crawl_status": "not_requested" if not bool(req.get("crawl_external") or req.get("enable_external_crawl")) else "pending",
+                "extraction_status": "not_requested" if not bool(req.get("crawl_external") or req.get("enable_external_crawl")) else "pending",
+                "geo_analysis_ready": False,
+                "content_score_policy": "citation_metadata_until_crawled",
+            })
+        write_json(target / "external_pages_full.json", {
+            "run_id": req.get("target_run_id"),
+            "brand": req.get("brand"),
+            "market": req.get("market"),
+            "source": "serpapi_citation_metadata",
+            "external_pages": pages,
+            "pages": pages,
+            "failed_sources": [],
+            "summary": {"attempted": len(pages), "successful": 0, "crawl_enabled": bool(req.get("crawl_external") or req.get("enable_external_crawl"))},
+        })
+
 def materialise_phase2_evidence_files(
     target: Path,
     req: dict[str, Any],
@@ -534,11 +712,18 @@ def materialise_phase2_evidence_files(
     write_json(target / "audit_context.json", audit_context)
     write_json(target / "evidence_scope.json", evidence_scope)
     write_json(target / "query_owned_url_mapping.json", {"run_id": req.get("target_run_id"), "query_portfolio_id": portfolio_id, "mappings": mappings, "mapped_owned_url_count": len(owned_urls)})
-    write_json(target / "google_ai_mode_compact.json", google_ai_mode)
+    existing_google = read_json(target / "google_ai_mode_compact.json", {}) or {}
+    existing_rows = existing_google.get("rows") or existing_google.get("queries") if isinstance(existing_google, dict) else []
+    has_completed_serpapi = isinstance(existing_rows, list) and any(str(r.get("status", "")).startswith("serpapi_completed") or r.get("source") == "serpapi_live" for r in existing_rows if isinstance(r, dict))
+    if has_completed_serpapi or (isinstance(existing_google, dict) and existing_google.get("source") == "serpapi_live"):
+        write_json(target / "google_ai_mode_compact.json", normalise_serpapi_compact_payload(existing_google))
+    else:
+        write_json(target / "google_ai_mode_compact.json", google_ai_mode)
     if not (target / "visibility_matrix.json").exists():
         write_json(target / "visibility_matrix.json", visibility_matrix)
     if not (target / "source_classification.json").exists():
         write_json(target / "source_classification.json", source_classification)
+    merge_serpapi_into_phase_files(target, req)
     owned_existing = read_json(target / "owned_pages_full.json", {})
     existing_pages = owned_existing.get("pages") if isinstance(owned_existing, dict) else None
     if not existing_pages:
@@ -661,7 +846,11 @@ def run_phase2_refresh(job_id: str, req: dict[str, Any]) -> None:
             serp_job = make_job_id("serpapi_inline")
             update_job(serp_job, {"status": "accepted", "job_id": serp_job, "parent_job_id": job_id, "target_run_id": target_run_id})
             run_serpapi_collection(serp_job, SerpApiJobRequest(brand=req.get("brand", ""), market=req.get("market", ""), target_run_id=target_run_id, queries=queries, max_queries=query_limit))
-            write_run_status(target_run_id, "running", {"stage": "serpapi_collection_completed", "serpapi_job_id": serp_job})
+            merge_serpapi_into_phase_files(target, {**req, "target_run_id": target_run_id})
+            google_after_serp = read_json(target / "google_ai_mode_compact.json", {}) or {}
+            serp_rows = google_after_serp.get("rows") or google_after_serp.get("queries") or []
+            serp_citations = sum(int(r.get("citation_count") or 0) for r in serp_rows if isinstance(r, dict)) if isinstance(serp_rows, list) else 0
+            write_run_status(target_run_id, "running", {"stage": "serpapi_collection_completed", "serpapi_job_id": serp_job, "serpapi_rows": len(serp_rows) if isinstance(serp_rows, list) else 0, "serpapi_citation_count": serp_citations})
 
         # Crawl mapped owned URLs and top external URLs from existing/source/current evidence.
         write_run_status(target_run_id, "running", {"stage": "crawl_refresh_running", "owned_url_count": len(owned_urls)})
@@ -688,6 +877,7 @@ def run_phase2_refresh(job_id: str, req: dict[str, Any]) -> None:
         # disabled. Re-materialise metadata scope afterwards so the Auditor can still
         # see the portfolio, mappings and owned URL candidates.
         materialise_phase2_evidence_files(target, {**req, "target_run_id": target_run_id}, portfolio, queries, sitemap_urls, mappings, owned_urls, portfolio_id)
+        merge_serpapi_into_phase_files(target, {**req, "target_run_id": target_run_id})
 
         auditor = None
         if bool(req.get("trigger_auditor", True)):
