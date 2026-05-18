@@ -20,6 +20,10 @@ router = APIRouter()
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data/evidence-runs"))
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
+CRAWL_MAX_READ_BYTES = int(os.environ.get("CRAWL_MAX_READ_BYTES", "1200000"))
+CRAWL_MARKDOWN_MAX_CHARS = int(os.environ.get("CRAWL_MARKDOWN_MAX_CHARS", "5000"))
+CRAWL_TEXT_MAX_CHARS = int(os.environ.get("CRAWL_TEXT_MAX_CHARS", "5000"))
+
 
 
 class CrawlRequest(BaseModel):
@@ -184,7 +188,7 @@ def fetch_page(url: str, timeout: int = 30) -> dict[str, Any]:
             },
         )
         with urlopen(req, timeout=timeout) as resp:
-            body = resp.read(2_500_000)
+            body = resp.read(CRAWL_MAX_READ_BYTES)
             status = getattr(resp, "status", None)
             content_type = resp.headers.get("content-type", "")
 
@@ -202,10 +206,28 @@ def fetch_page(url: str, timeout: int = 30) -> dict[str, Any]:
         parser.feed(html)
 
         text = parser.text
+        word_count = len(re.findall(r"\w+", text))
+        # Railway volume-safe persistence: keep compact snippets only. Large raw page
+        # bodies caused 500 MB volume exhaustion during full-refresh crawls.
+        compact_text = text[:CRAWL_TEXT_MAX_CHARS].rstrip()
+        compact_markdown = text[:CRAWL_MARKDOWN_MAX_CHARS].rstrip()
+        json_ld_blocks = re.findall(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, flags=re.I | re.S)
+        canonical_match = re.search(r'<link[^>]+rel=["\']canonical["\'][^>]+href=["\']([^"\']+)', html, flags=re.I)
+        description_match = re.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']*)', html, flags=re.I)
         result["title"] = parser.title
-        result["text"] = text
-        result["markdown"] = text
-        result["word_count"] = len(re.findall(r"\w+", text))
+        result["text"] = compact_text
+        result["markdown"] = compact_markdown
+        result["content_extract"] = compact_text
+        result["word_count"] = word_count
+        result["text_chars"] = len(text)
+        result["markdown_chars"] = len(compact_markdown)
+        result["raw_markdown_chars"] = len(text)
+        result["json_ld_present"] = bool(json_ld_blocks)
+        result["json_ld_block_count"] = len(json_ld_blocks)
+        result["schema_types_detected"] = sorted(set(re.findall(r'"@type"\s*:\s*"([^"\n]+)"', "\n".join(json_ld_blocks))))[:20]
+        result["canonical_url"] = canonical_match.group(1) if canonical_match else ""
+        result["description"] = description_match.group(1)[:500] if description_match else ""
+        result["crawl_storage_mode"] = "compact_only"
         result["crawl_status"] = "success" if text else "empty_extract"
         return result
 

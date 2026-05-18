@@ -331,17 +331,125 @@ def post_build_bodhi_compact(run_id: str, x_admin_token: str | None = Header(def
 
 
 class CleanupRunsRequest(BaseModel):
+    # Backwards-compatible accepted names. Earlier frontend/scripts used preserve_run_ids,
+    # while the original endpoint only respected keep_run_ids. Keep both.
     keep_run_ids: list[str] = Field(default_factory=list)
+    preserve_run_ids: list[str] = Field(default_factory=list)
     delete_run_ids: list[str] = Field(default_factory=list)
     dry_run: bool = True
     delete_jobs: bool = False
+    force: bool = False
+
+
+PROTECTED_RUN_DIRS = {
+    "run_status",
+    "latest_successful",
+    "portfolios",
+    "_jobs",
+}
+
+
+def dir_size_bytes(path: Path) -> int:
+    if not path.exists():
+        return 0
+    if path.is_file():
+        try:
+            return path.stat().st_size
+        except OSError:
+            return 0
+    total = 0
+    for child in path.rglob("*"):
+        try:
+            if child.is_file() or child.is_symlink():
+                total += child.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def safe_stat_dir(path: Path) -> dict[str, Any]:
+    json_files = 0
+    total_files = 0
+    largest_files: list[dict[str, Any]] = []
+    if path.exists():
+        for child in path.rglob("*"):
+            try:
+                if not child.is_file():
+                    continue
+                total_files += 1
+                if child.suffix.lower() == ".json":
+                    json_files += 1
+                size = child.stat().st_size
+                largest_files.append({"path": str(child.relative_to(path)), "size_bytes": size, "size_mb": round(size / 1024 / 1024, 3)})
+            except OSError:
+                continue
+    largest_files.sort(key=lambda x: x["size_bytes"], reverse=True)
+    return {
+        "path": str(path),
+        "exists": path.exists(),
+        "size_bytes": dir_size_bytes(path),
+        "size_mb": round(dir_size_bytes(path) / 1024 / 1024, 3),
+        "total_files": total_files,
+        "json_files": json_files,
+        "largest_files": largest_files[:10],
+    }
+
+
+def list_run_dirs() -> list[dict[str, Any]]:
+    if not DATA_DIR.exists():
+        return []
+    rows = []
+    for p in DATA_DIR.iterdir():
+        if not p.is_dir():
+            continue
+        size = dir_size_bytes(p)
+        updated = 0.0
+        try:
+            updated = p.stat().st_mtime
+        except OSError:
+            pass
+        rows.append({
+            "run_id": p.name,
+            "path": str(p),
+            "protected": p.name in PROTECTED_RUN_DIRS,
+            "size_bytes": size,
+            "size_mb": round(size / 1024 / 1024, 3),
+            "updated_at_epoch": int(updated) if updated else None,
+        })
+    rows.sort(key=lambda x: x["size_bytes"], reverse=True)
+    return rows
+
+
+@router.get("/admin/storage")
+def storage_report(x_admin_token: str | None = Header(default=None)):
+    require_admin(x_admin_token)
+    usage = shutil.disk_usage(DATA_DIR if DATA_DIR.exists() else DATA_DIR.parent)
+    runs = list_run_dirs()
+    return {
+        "status": "ok",
+        "data_dir": str(DATA_DIR),
+        "disk": {
+            "total_bytes": usage.total,
+            "used_bytes": usage.used,
+            "free_bytes": usage.free,
+            "total_mb": round(usage.total / 1024 / 1024, 1),
+            "used_mb": round(usage.used / 1024 / 1024, 1),
+            "free_mb": round(usage.free / 1024 / 1024, 1),
+            "used_pct": round((usage.used / usage.total) * 100, 1) if usage.total else None,
+        },
+        "protected_run_dirs": sorted(PROTECTED_RUN_DIRS),
+        "run_count": len(runs),
+        "runs": runs,
+        "largest_runs": runs[:15],
+        "data_dir_detail": safe_stat_dir(DATA_DIR),
+    }
 
 
 @router.post("/admin/cleanup-runs")
 def cleanup_runs(req: CleanupRunsRequest, x_admin_token: str | None = Header(default=None)):
     require_admin(x_admin_token)
 
-    keep = set(req.keep_run_ids or [])
+    keep = set(req.keep_run_ids or []) | set(req.preserve_run_ids or []) | PROTECTED_RUN_DIRS
     delete = set(req.delete_run_ids or [])
 
     if not DATA_DIR.exists():
@@ -349,41 +457,66 @@ def cleanup_runs(req: CleanupRunsRequest, x_admin_token: str | None = Header(def
 
     deleted = []
     skipped = []
-    candidates = []
+    candidates: list[Path] = []
 
     for p in DATA_DIR.iterdir():
         if not p.is_dir():
             continue
         if p.name == "_jobs":
+            skipped.append({"run_id": p.name, "reason": "protected_system_dir"})
             continue
         if delete and p.name not in delete:
+            skipped.append({"run_id": p.name, "reason": "not_in_delete_run_ids"})
             continue
         if p.name in keep:
-            skipped.append({"run_id": p.name, "reason": "kept"})
+            skipped.append({"run_id": p.name, "reason": "kept_or_protected"})
             continue
         candidates.append(p)
 
+    protected_candidates = [p.name for p in candidates if p.name in PROTECTED_RUN_DIRS]
+    if protected_candidates and not req.force:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Refusing to delete protected/system directories without force=true.",
+                "protected_candidates": protected_candidates,
+                "protected_run_dirs": sorted(PROTECTED_RUN_DIRS),
+            },
+        )
+
     for p in candidates:
+        item = {"run_id": p.name, "path": str(p), "size_mb": round(dir_size_bytes(p) / 1024 / 1024, 3)}
         if req.dry_run:
-            deleted.append({"run_id": p.name, "path": str(p), "dry_run": True})
+            item["dry_run"] = True
+            deleted.append(item)
         else:
             shutil.rmtree(p, ignore_errors=True)
-            deleted.append({"run_id": p.name, "path": str(p), "deleted": True})
+            item["deleted"] = True
+            deleted.append(item)
 
     jobs_deleted = None
     jobs_path = DATA_DIR / "_jobs"
     if req.delete_jobs and jobs_path.exists():
+        if not req.force:
+            raise HTTPException(status_code=400, detail="Refusing to delete _jobs without force=true")
         if req.dry_run:
-            jobs_deleted = {"path": str(jobs_path), "dry_run": True}
+            jobs_deleted = {"path": str(jobs_path), "dry_run": True, "size_mb": round(dir_size_bytes(jobs_path) / 1024 / 1024, 3)}
         else:
             shutil.rmtree(jobs_path, ignore_errors=True)
             jobs_deleted = {"path": str(jobs_path), "deleted": True}
 
+    usage = shutil.disk_usage(DATA_DIR if DATA_DIR.exists() else DATA_DIR.parent)
     return {
         "status": "dry_run" if req.dry_run else "success",
         "data_dir": str(DATA_DIR),
+        "protected_run_dirs": sorted(PROTECTED_RUN_DIRS),
         "kept": sorted(list(keep)),
         "deleted_or_would_delete": deleted,
         "skipped": skipped,
         "jobs": jobs_deleted,
+        "disk_after": {
+            "used_mb": round(usage.used / 1024 / 1024, 1),
+            "free_mb": round(usage.free / 1024 / 1024, 1),
+            "used_pct": round((usage.used / usage.total) * 100, 1) if usage.total else None,
+        },
     }
