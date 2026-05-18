@@ -652,6 +652,80 @@ def merge_serpapi_into_phase_files(target: Path, req: dict[str, Any]) -> None:
             "summary": {"attempted": len(pages), "successful": 0, "crawl_enabled": bool(req.get("crawl_external") or req.get("enable_external_crawl"))},
         })
 
+
+def copy_existing_ai_evidence_from_source(target: Path, req: dict[str, Any], queries: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Reuse Google AI Mode / SerpAPI citation evidence from a prior evidence run.
+
+    This supports the UI pattern: rerun mapping/CMS/Auditor without spending new
+    SerpAPI calls. Portfolio IDs identify query sets only; citation evidence lives
+    on prior evidence run IDs, so this function copies and filters citation files
+    from source_run_id into the new target run before Auditor trigger.
+    """
+    source_run_id = str(req.get("source_run_id") or "").strip()
+    if not source_run_id:
+        return {"reused": False, "reason": "source_run_id_not_supplied"}
+    source = DATA_DIR / source_run_id
+    if not source.exists():
+        return {"reused": False, "reason": f"source_run_id_not_found:{source_run_id}"}
+
+    query_ids = {str(q.get("query_id") or "").strip() for q in (queries or []) if isinstance(q, dict) and q.get("query_id")}
+    query_texts = {clean_text_value(q.get("query") or "").lower() for q in (queries or []) if isinstance(q, dict) and q.get("query")}
+
+    def row_matches(row: dict[str, Any]) -> bool:
+        if not query_ids and not query_texts:
+            return True
+        qid = str(row.get("query_id") or "").strip()
+        qtext = clean_text_value(row.get("query") or "").lower()
+        return (qid and qid in query_ids) or (qtext and qtext in query_texts)
+
+    source_google = normalise_serpapi_compact_payload(read_json(source / "google_ai_mode_compact.json", {}) or {})
+    rows = source_google.get("rows") or source_google.get("queries") or []
+    if not isinstance(rows, list):
+        rows = []
+    rows = [r for r in rows if isinstance(r, dict) and row_matches(r)]
+
+    if not rows:
+        return {"reused": False, "reason": "source_run_has_no_matching_google_ai_rows", "source_run_id": source_run_id}
+
+    reused_google = dict(source_google)
+    reused_google["rows"] = rows
+    reused_google["queries"] = rows
+    reused_google["source"] = "reused_google_ai_mode_from_source_run"
+    reused_google["source_run_id"] = source_run_id
+    reused_google.setdefault("summary", {})
+    if isinstance(reused_google["summary"], dict):
+        reused_google["summary"].update({
+            "reused_from_source_run_id": source_run_id,
+            "reused_rows": len(rows),
+            "queries_with_citations": sum(1 for r in rows if int(r.get("citation_count") or 0) > 0),
+            "total_citations": sum(int(r.get("citation_count") or 0) for r in rows),
+        })
+    write_json(target / "google_ai_mode_compact.json", reused_google)
+
+    # Preserve existing source/citation fields where possible, then rebuild them
+    # from the copied Google AI rows so the contract is stable.
+    merge_serpapi_into_phase_files(target, {**req, "target_run_id": req.get("target_run_id")})
+
+    # If a source run had richer classification/external files, keep useful fields
+    # but never overwrite the rebuilt query-level citations.
+    for filename in ["source_classification.json", "external_pages_full.json"]:
+        src_file = source / filename
+        dst_file = target / filename
+        if src_file.exists() and not dst_file.exists():
+            payload = read_json(src_file, {}) or {}
+            if isinstance(payload, dict):
+                payload["source_run_id"] = source_run_id
+                payload["source"] = f"reused_{filename.replace('.json','')}"
+                write_json(dst_file, payload)
+
+    citation_total = sum(int(r.get("citation_count") or 0) for r in rows)
+    return {
+        "reused": True,
+        "source_run_id": source_run_id,
+        "reused_rows": len(rows),
+        "reused_citation_count": citation_total,
+    }
+
 def materialise_phase2_evidence_files(
     target: Path,
     req: dict[str, Any],
@@ -927,6 +1001,13 @@ def run_phase2_refresh(job_id: str, req: dict[str, Any]) -> None:
         # for no-SerpAPI/no-crawl dry refreshes.
         materialise_phase2_evidence_files(target, {**req, "target_run_id": target_run_id}, portfolio, queries, sitemap_urls, mappings, owned_urls, portfolio_id)
 
+        # Reuse Google AI Mode/SerpAPI citation evidence from a prior evidence run
+        # when requested. This lets CMS/Auditor changes be tested without spending
+        # new SerpAPI calls.
+        if req.get("source_run_id") and not bool(req.get("run_serpapi") or req.get("enable_serpapi")) and bool(req.get("use_existing_google_ai_mode", True)):
+            reuse_info = copy_existing_ai_evidence_from_source(target, {**req, "target_run_id": target_run_id}, queries)
+            write_run_status(target_run_id, "running", {"stage": "ai_citation_reuse_completed", **reuse_info})
+
         # Optional live SerpAPI collection owned by evidence service.
         if bool(req.get("run_serpapi") or req.get("enable_serpapi")) and queries:
             write_run_status(target_run_id, "running", {"stage": "serpapi_collection_running", "serpapi_query_count": len(queries)})
@@ -964,7 +1045,11 @@ def run_phase2_refresh(job_id: str, req: dict[str, Any]) -> None:
         # disabled. Re-materialise metadata scope afterwards so the Auditor can still
         # see the portfolio, mappings and owned URL candidates.
         materialise_phase2_evidence_files(target, {**req, "target_run_id": target_run_id}, portfolio, queries, sitemap_urls, mappings, owned_urls, portfolio_id)
-        merge_serpapi_into_phase_files(target, {**req, "target_run_id": target_run_id})
+        if req.get("source_run_id") and not bool(req.get("run_serpapi") or req.get("enable_serpapi")) and bool(req.get("use_existing_google_ai_mode", True)):
+            reuse_info = copy_existing_ai_evidence_from_source(target, {**req, "target_run_id": target_run_id}, queries)
+            write_run_status(target_run_id, "running", {"stage": "ai_citation_reuse_completed", **reuse_info})
+        else:
+            merge_serpapi_into_phase_files(target, {**req, "target_run_id": target_run_id})
 
         auditor = None
         if bool(req.get("trigger_auditor", True)):
