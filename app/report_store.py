@@ -270,7 +270,9 @@ def _report_history_row(manifest: dict[str, Any], status: dict[str, Any] | None 
         "created_at_epoch": manifest.get("created_at_epoch") or status.get("created_at_epoch") or status.get("started_at_epoch"),
         "completed_at_epoch": manifest.get("completed_at_epoch") or status.get("completed_at_epoch"),
         "query_count": status.get("query_count") or headline.get("query_count"),
-        "owned_pages_scoreable": status.get("owned_pages_scoreable") or headline.get("owned_page_count"),
+        "owned_pages_scoreable": status.get("owned_pages_scoreable") or status.get("owned_inventory_scored") or headline.get("owned_page_count"),
+        "owned_inventory_selected": status.get("owned_inventory_selected") or status.get("owned_inventory_url_count"),
+        "owned_query_mapped_unique": status.get("owned_query_mapped_unique"),
         "external_pages_scoreable": status.get("external_pages_scoreable"),
         "citation_count": status.get("external_citation_count") or status.get("serpapi_citation_count"),
         "serpapi_enabled": bool((status.get("request") or {}).get("run_serpapi") or (status.get("request") or {}).get("enable_serpapi")),
@@ -379,6 +381,8 @@ class RefreshEvidenceRequest(BaseModel):
     max_owned_pages_per_query: int = 3
     max_external_citations_per_query: int = 3
     max_owned_urls: int = 60
+    # v3.5.3: site-level inventory GEO audit cap, separate from per-query mapping.
+    max_owned_inventory_urls: int | None = None
     max_external_urls: int = 30
 
     # Evidence execution flags owned by Railway evidence service.

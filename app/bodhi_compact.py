@@ -242,6 +242,8 @@ def build_bodhi_bundle(run_id: str) -> dict[str, Any]:
 
     slim_owned = [slim_owned_page(p) for p in owned_pages if isinstance(p, dict)]
     slim_external = [slim_external_page(p) for p in external_pages if isinstance(p, dict)]
+    query_mapped_unique = sum(1 for p in slim_owned if p.get("query_mapped"))
+    inventory_selected = len(slim_owned)
 
     owned_payload = {
         **{k: v for k, v in owned_full.items() if k != "pages"},
@@ -280,6 +282,8 @@ def build_bodhi_bundle(run_id: str) -> dict[str, Any]:
         "ai_discoverability_hygiene": site_ai_hygiene,
         "counts": {
             "owned_pages": len(slim_owned),
+            "owned_inventory_pages": inventory_selected,
+            "owned_query_mapped_unique": query_mapped_unique,
             "external_pages": len(slim_external),
             "owned_pages_scoreable": sum(
                 1 for p in slim_owned

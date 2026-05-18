@@ -205,6 +205,81 @@ def effective_max_owned_urls(req: dict[str, Any], fallback: int = 60) -> int:
         return 100
     return max(0, value)
 
+
+
+def effective_max_owned_inventory_urls(req: dict[str, Any], fallback: int = 60) -> int:
+    """Return site-level owned inventory GEO audit cap.
+
+    This is intentionally separate from max_owned_pages_per_query, which controls
+    query-to-page mapping precision.  Frontend v23.4 may send
+    max_owned_inventory_urls; older clients send max_owned_urls.
+    """
+    try:
+        value = int(req.get("max_owned_inventory_urls") or req.get("max_owned_urls") or fallback)
+    except Exception:
+        value = fallback
+    if is_full_refresh_request(req) and value <= 60:
+        value = 60 if req.get("max_owned_inventory_urls") else 100
+    return max(0, value)
+
+
+def _inventory_url_priority(url: str) -> tuple[int, int, str]:
+    u = str(url or "").lower()
+    score = 0
+    # Prefer meaningful product, guide, service and support pages over utility assets.
+    positive = [
+        "/vehicles/", "/vehicle/", "/cars/", "/ev", "charging", "range",
+        "battery", "safety", "finance", "offer", "service", "warranty",
+        "owner", "support", "recall", "dealer", "test-drive", "purchase",
+        "compare", "specification", "specifications", "price", "catalog",
+    ]
+    negative = [
+        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".pdf",
+        "/assets/", "/static/", "/css/", "/js/", "/privacy", "/terms",
+        "/cookie", "/sitemap", "/search", "#", "?",
+    ]
+    for token in positive:
+        if token in u:
+            score += 10
+    for token in negative:
+        if token in u:
+            score -= 20
+    depth = u.count("/")
+    # Avoid extremely deep utility pages unless they are query mapped.
+    if depth > 8:
+        score -= 3
+    return (-score, depth, u)
+
+
+def select_owned_inventory_urls(sitemap_urls: list[str], mapped_owned_urls: list[str], limit: int) -> list[str]:
+    """Select broad site-level inventory URLs for GEO readiness scoring.
+
+    Query-mapped URLs are always prioritised, then the remainder is filled from
+    meaningful sitemap URLs.  This lets the Owned URL screen show overall site
+    readiness, while query diagnostics continue using top mapped URLs only.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for url in mapped_owned_urls or []:
+        u = str(url or "").strip().split("#")[0].rstrip("/")
+        if u and u not in seen:
+            seen.add(u); out.append(u)
+            if limit and len(out) >= limit:
+                return out
+    candidates = []
+    for url in sitemap_urls or []:
+        u = str(url or "").strip().split("#")[0].rstrip("/")
+        if not u or u in seen:
+            continue
+        candidates.append(u)
+    for u in sorted(candidates, key=_inventory_url_priority):
+        if u in seen:
+            continue
+        seen.add(u); out.append(u)
+        if limit and len(out) >= limit:
+            break
+    return out
+
 def trigger_and_wait_for_portfolio(req: dict[str, Any], target_run_id: str) -> dict[str, Any]:
     run_started_epoch = now_epoch()
     task_id = os.getenv("BODHI_PORTFOLIO_TASK_ID", "")
@@ -910,6 +985,7 @@ def materialise_phase2_evidence_files(
     mappings: list[dict[str, Any]],
     owned_urls: list[str],
     portfolio_id: str | None,
+    mapped_owned_urls: list[str] | None = None,
 ) -> None:
     """Write Bodhi-compact compatible files even when SerpAPI/crawling is disabled.
 
@@ -921,6 +997,8 @@ def materialise_phase2_evidence_files(
     market = req.get("market") or ""
     domain = req.get("domain") or ""
     query_by_id = {q.get("query_id"): q for q in queries if isinstance(q, dict)}
+    mapped_owned_urls = mapped_owned_urls or []
+    mapped_url_set = {str(u).rstrip("/") for u in mapped_owned_urls if u}
     mappings_by_url: dict[str, list[dict[str, Any]]] = {}
     for m in mappings:
         u = m.get("url")
@@ -943,8 +1021,11 @@ def materialise_phase2_evidence_files(
             "url": url,
             "final_url": url,
             "rank": idx,
-            "selection_reason": "Mapped from synthetic query portfolio and sitemap inventory.",
-            "mapping_quality": "candidate" if rel else "fallback_candidate",
+            "selection_reason": "Query-mapped URL retained for opportunity analysis." if rel else "Site-level inventory URL selected for broader GEO readiness audit.",
+            "inventory_source": "query_mapped" if str(url).rstrip("/") in mapped_url_set else "sitemap_inventory",
+            "site_inventory_audit": True,
+            "query_mapped": bool(rel),
+            "mapping_quality": "candidate" if rel else "inventory_only",
             "mapping_score": max([int(m.get("mapping_score") or 0) for m in rel] or [0]),
             "mapping_reason": "; ".join([clean_text_value(m.get("mapping_reason")) for m in rel[:3] if m.get("mapping_reason")]) or "Sitemap candidate retained for owned-page GEO mapping.",
             "brand_topic_category": categories[0] if categories else None,
@@ -976,7 +1057,7 @@ def materialise_phase2_evidence_files(
         "pages": owned_pages,
         "owned_urls": owned_pages,
         "query_owned_url_mapping": mappings,
-        "counts": {"queries": len(queries), "owned_pages": len(owned_pages), "mappings": len(mappings), "sitemap_urls": len(sitemap_urls)},
+        "counts": {"queries": len(queries), "owned_inventory_pages": len(owned_pages), "owned_query_mapped_unique": len(mapped_url_set), "owned_pages": len(owned_pages), "mappings": len(mappings), "sitemap_urls": len(sitemap_urls)},
     }
     evidence_scope = {
         "schema_version": "evidence_scope.v2",
@@ -998,6 +1079,10 @@ def materialise_phase2_evidence_files(
             "mode": req.get("mode") or req.get("run_mode") or "phase2_refresh",
             "output_language": req.get("output_language") or req.get("language") or "English",
             "serpapi_hl": "en",
+            "owned_inventory_selected": len(owned_pages),
+            "owned_query_mapped_unique": len(mapped_url_set),
+            "mapped_owned_urls_per_query": req.get("max_owned_pages_per_query") or req.get("max_owned_urls_per_query") or 3,
+            "max_owned_inventory_urls": req.get("max_owned_inventory_urls") or req.get("max_owned_urls"),
         },
     }
     google_ai_mode = {
@@ -1047,7 +1132,7 @@ def materialise_phase2_evidence_files(
     write_json(target / "query_portfolio.json", portfolio or {})
     write_json(target / "audit_context.json", audit_context)
     write_json(target / "evidence_scope.json", evidence_scope)
-    write_json(target / "query_owned_url_mapping.json", {"run_id": req.get("target_run_id"), "query_portfolio_id": portfolio_id, "mappings": mappings, "mapped_owned_url_count": len(owned_urls)})
+    write_json(target / "query_owned_url_mapping.json", {"run_id": req.get("target_run_id"), "query_portfolio_id": portfolio_id, "mappings": mappings, "mapped_owned_url_count": len(mapped_url_set), "mapped_owned_urls": sorted(mapped_url_set)})
     existing_google = read_json(target / "google_ai_mode_compact.json", {}) or {}
     existing_rows = existing_google.get("rows") or existing_google.get("queries") if isinstance(existing_google, dict) else []
     has_completed_serpapi = isinstance(existing_rows, list) and any(str(r.get("status", "")).startswith("serpapi_completed") or r.get("source") == "serpapi_live" for r in existing_rows if isinstance(r, dict))
@@ -1091,6 +1176,7 @@ def trigger_auditor_if_configured(req: dict[str, Any], target_run_id: str, portf
         "query_portfolio_mode": req.get("query_portfolio_mode") or "reuse",
         "query_portfolio_id": portfolio_id or "",
         "max_owned_pages_per_query": req.get("max_owned_pages_per_query") or req.get("max_owned_urls_per_query") or 3,
+        "max_owned_inventory_urls": req.get("max_owned_inventory_urls") or req.get("max_owned_urls") or "",
         # Keep both names for compatibility with older evidence payloads and the v9.2 UI field.
         "max_external_sources_per_query": max_external,
         "max_external_citations_per_query": max_external,
@@ -1166,15 +1252,19 @@ def run_phase2_refresh(job_id: str, req: dict[str, Any]) -> None:
         write_json(target / "sitemap_inventory.json", {"source": sitemap_url or "auto_discovered", "url_count": len(sitemap_urls), "urls": sitemap_urls, "generated_at_epoch": now_epoch(), "fallback_used": not bool(sitemap_urls), "sitemap_discovery": sitemap_discovery})
 
         owned_urls: list[str] = []
+        mapped_owned: list[str] = []
         mappings: list[dict[str, Any]] = []
         if portfolio and sitemap_urls:
             write_run_status(target_run_id, "running", {"stage": "owned_url_mapping_running", "sitemap_url_count": len(sitemap_urls)})
             mappings, mapped_owned = map_queries_to_sitemap(portfolio, sitemap_urls, int(req.get("max_owned_pages_per_query") or req.get("max_owned_urls_per_query") or 3))
-            owned_urls = mapped_owned[: effective_max_owned_urls(req, 60)]
+            inventory_cap = effective_max_owned_inventory_urls(req, effective_max_owned_urls(req, 60))
+            owned_urls = select_owned_inventory_urls(sitemap_urls, mapped_owned, inventory_cap)
+
+        write_run_status(target_run_id, "running", {"stage": "owned_inventory_selected", "owned_inventory_selected": len(owned_urls), "owned_query_mapped_unique": len(set(mapped_owned)), "sitemap_url_count": len(sitemap_urls)})
 
         # Materialise scope before optional crawl so /bodhi-compact is useful even
         # for no-SerpAPI/no-crawl dry refreshes.
-        materialise_phase2_evidence_files(target, {**req, "target_run_id": target_run_id}, portfolio, queries, sitemap_urls, mappings, owned_urls, portfolio_id)
+        materialise_phase2_evidence_files(target, {**req, "target_run_id": target_run_id}, portfolio, queries, sitemap_urls, mappings, owned_urls, portfolio_id, mapped_owned)
 
         # Reuse Google AI Mode/SerpAPI citation evidence from a prior evidence run
         # when requested. This lets CMS/Auditor changes be tested without spending
@@ -1196,7 +1286,7 @@ def run_phase2_refresh(job_id: str, req: dict[str, Any]) -> None:
             write_run_status(target_run_id, "running", {"stage": "serpapi_collection_completed", "serpapi_job_id": serp_job, "serpapi_rows": len(serp_rows) if isinstance(serp_rows, list) else 0, "serpapi_citation_count": serp_citations})
 
         # Crawl mapped owned URLs and top external URLs from existing/source/current evidence.
-        write_run_status(target_run_id, "running", {"stage": "crawl_refresh_running", "owned_url_count": len(owned_urls)})
+        write_run_status(target_run_id, "running", {"stage": "crawl_refresh_running", "owned_inventory_url_count": len(owned_urls), "owned_query_mapped_unique": len(set(mapped_owned))})
         refresh_req = FullRefreshRequest(
             brand=req.get("brand", ""),
             market=req.get("market", ""),
@@ -1211,7 +1301,7 @@ def run_phase2_refresh(job_id: str, req: dict[str, Any]) -> None:
             crawl_owned=bool(req.get("crawl_owned", req.get("enable_owned_crawl", True))),
             crawl_external=bool(req.get("crawl_external", req.get("enable_external_crawl", False))),
             max_queries=query_limit,
-            max_owned_urls=effective_max_owned_urls(req, max(20, len(owned_urls) or 20)),
+            max_owned_urls=effective_max_owned_inventory_urls(req, max(20, len(owned_urls) or 20)),
             max_external_urls=int(req.get("max_external_urls") or 30),
         )
         run_full_refresh(job_id, refresh_req)
@@ -1219,7 +1309,7 @@ def run_phase2_refresh(job_id: str, req: dict[str, Any]) -> None:
         # run_full_refresh can legitimately write empty crawl files when crawling is
         # disabled. Re-materialise metadata scope afterwards so the Auditor can still
         # see the portfolio, mappings and owned URL candidates.
-        materialise_phase2_evidence_files(target, {**req, "target_run_id": target_run_id}, portfolio, queries, sitemap_urls, mappings, owned_urls, portfolio_id)
+        materialise_phase2_evidence_files(target, {**req, "target_run_id": target_run_id}, portfolio, queries, sitemap_urls, mappings, owned_urls, portfolio_id, mapped_owned)
         if req.get("source_run_id") and not bool(req.get("run_serpapi") or req.get("enable_serpapi")) and bool(req.get("use_existing_google_ai_mode", True)):
             reuse_info = copy_existing_ai_evidence_from_source(target, {**req, "target_run_id": target_run_id}, queries)
             write_run_status(target_run_id, "running", {"stage": "ai_citation_reuse_completed", **reuse_info})
