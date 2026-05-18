@@ -646,6 +646,9 @@ def normalise_serpapi_row(query_id: str, query_text: str, q: dict[str, Any], raw
         'citation_count': len(refs),
         'status': status,
         'raw_response_keys': list(raw.keys())[:50] if isinstance(raw, dict) else [],
+        'reconstructed_markdown': _compact_text(raw.get('reconstructed_markdown'), 5000) if isinstance(raw, dict) else '',
+        'search_parameters': raw.get('search_parameters', {}) if isinstance(raw, dict) else {},
+        'search_metadata': raw.get('search_metadata', {}) if isinstance(raw, dict) else {},
         'raw_file': raw_file,
     }
 
@@ -676,7 +679,7 @@ def run_serpapi_collection(job_id: str, req: SerpApiJobRequest):
                 "engine": SERPAPI_ENGINE,
                 "q": query_text,
                 "api_key": SERPAPI_KEY,
-                "hl": "ja" if req.market.lower() == "japan" else "en",
+                "hl": "en",  # Executive dashboard output language; keep gl market-localised separately.
                 "gl": "jp" if req.market.lower() == "japan" else "us",
             }
 

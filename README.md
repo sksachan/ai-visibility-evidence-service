@@ -165,3 +165,8 @@ curl -X POST "$EVIDENCE_SERVICE_URL/refresh/evidence" \
 ```
 
 Then inspect `/runs/<run_id>/bodhi-compact`; `google_ai_mode_compact.rows[].answer_summary` must no longer say `SerpAPI collection pending.`
+
+## v3.4.7 notes
+- Forces SerpAPI Google AI Mode calls to `hl=en` while preserving market localisation with `gl=jp` for Japan.
+- Preserves SerpAPI references, reconstructed markdown, search metadata and search parameters in `google_ai_mode_compact`.
+- Classifies citation sources into owned, competitor, authority/partner, publisher, social/video, shopping and generic citation groups for downstream reporting.

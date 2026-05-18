@@ -449,6 +449,26 @@ def source_domain(url: Any) -> str:
         return ""
 
 
+
+def source_type_from_url(url: Any) -> str:
+    d = source_domain(url)
+    u = str(url or "").lower()
+    if not d:
+        return "external_citation"
+    if "nissan" in d:
+        return "owned_oem"
+    if any(x in d for x in ["toyota", "honda", "mazda", "subaru", "mitsubishi", "tesla", "hyundai", "kia", "bmw", "mercedes", "volkswagen"]):
+        return "competitor_owned"
+    if any(x in d for x in ["youtube", "reddit", "x.com", "twitter", "facebook", "instagram"]):
+        return "forum_social_video"
+    if any(x in d for x in ["chademo", "e-mobipower", "shutoko", "meti", "mlit", "go.jp", "or.jp"]):
+        return "authority_or_partner"
+    if any(x in d for x in ["gazoo", "motorweek", "recharged", "bonnet", "autocar", "carwow", "caranddriver", "carsguide"]):
+        return "publisher_review"
+    if "google" in d and "product" in u:
+        return "shopping_result"
+    return "external_citation"
+
 def normalise_serpapi_compact_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """Make SerpAPI output compatible with the Auditor contract.
 
@@ -488,7 +508,7 @@ def normalise_serpapi_compact_payload(payload: dict[str, Any]) -> dict[str, Any]
                 "source_domain": ref.get("source_domain") or source_domain(url),
                 "source_name": clean_text_value(ref.get("source_name") or ref.get("source") or source_domain(url)),
                 "snippet": clean_text_value(ref.get("snippet") or ref.get("description") or ref.get("text")),
-                "source_type": ref.get("source_type") or "external_citation",
+                "source_type": ref.get("source_type") or source_type_from_url(url),
             })
         summary = clean_text_value(rr.get("answer_summary") or rr.get("summary") or rr.get("answer"))
         if not summary or summary == "SerpAPI collection pending.":
@@ -498,6 +518,9 @@ def normalise_serpapi_compact_payload(payload: dict[str, Any]) -> dict[str, Any]
             status = "serpapi_completed_with_citations" if clean_refs else "serpapi_completed_no_citations"
         rr.update({
             "answer_summary": summary,
+            "reconstructed_markdown": clean_text_value(rr.get("reconstructed_markdown"), 8000),
+            "search_parameters": rr.get("search_parameters") if isinstance(rr.get("search_parameters"), dict) else {},
+            "search_metadata": rr.get("search_metadata") if isinstance(rr.get("search_metadata"), dict) else {},
             "references": clean_refs,
             "top_citations": clean_refs[:3],
             "top_cited_sources": clean_refs[:3],
@@ -515,7 +538,7 @@ def normalise_serpapi_compact_payload(payload: dict[str, Any]) -> dict[str, Any]
             "captured_queries": len(norm_rows),
             "queries_with_citations": sum(1 for r in norm_rows if int(r.get("citation_count") or 0) > 0),
             "total_citations": sum(int(r.get("citation_count") or 0) for r in norm_rows),
-            "normalised_by": "evidence_service_v3.4.5",
+            "normalised_by": "evidence_service_v3.4.7",
         })
     return out
 
@@ -537,7 +560,7 @@ def merge_serpapi_into_phase_files(target: Path, req: dict[str, Any]) -> None:
             url = ref.get("url") or ref.get("source_url")
             if not url:
                 continue
-            rec = {**ref, "query_id": qid, "query": qtext, "citation_position": ref.get("rank"), "source_type": ref.get("source_type") or "external_citation"}
+            rec = {**ref, "query_id": qid, "query": qtext, "citation_position": ref.get("rank"), "source_type": ref.get("source_type") or source_type_from_url(url)}
             citation_records.append(rec)
             source_by_url.setdefault(url, {**ref, "url": url, "source_url": url, "source_domain": ref.get("source_domain") or source_domain(url), "citation_count": 0, "queries": []})
             source_by_url[url]["citation_count"] = int(source_by_url[url].get("citation_count") or 0) + 1
@@ -714,6 +737,8 @@ def materialise_phase2_evidence_files(
             "owned_crawl_enabled": bool(req.get("crawl_owned", req.get("enable_owned_crawl", False))),
             "external_crawl_enabled": bool(req.get("crawl_external", req.get("enable_external_crawl", False))),
             "mode": req.get("mode") or req.get("run_mode") or "phase2_refresh",
+            "output_language": req.get("output_language") or req.get("language") or "English",
+            "serpapi_hl": "en",
         },
     }
     google_ai_mode = {
