@@ -375,17 +375,52 @@ def fetch_sitemap_urls(domain: str | None, sitemap_url: str | None, max_urls: in
 
 
 def check_site_ai_hygiene(domain: str | None, owned_pages: list[dict[str, Any]], discovery: dict[str, Any] | None = None) -> dict[str, Any]:
-    base = str(domain or "").strip().rstrip("/")
     headers = {"User-Agent": "ai-visibility-evidence-service/3.5.2"}
+
+    def base_candidates() -> list[str]:
+        values: list[str] = []
+        def add(url: str | None):
+            if not url:
+                return
+            try:
+                parsed = urlparse(str(url))
+                if parsed.scheme and parsed.netloc:
+                    candidate = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+                    if candidate not in values:
+                        values.append(candidate)
+            except Exception:
+                return
+        add(domain)
+        if discovery:
+            for key in ["robots_url", "discovered_sitemaps", "candidates"]:
+                v = discovery.get(key)
+                if isinstance(v, list):
+                    for item in v:
+                        add(item)
+                else:
+                    add(v)
+        for page in owned_pages:
+            if isinstance(page, dict):
+                add(page.get("resolved_url") or page.get("final_url") or page.get("url"))
+        return values
+
     def fetch_status(path: str) -> dict[str, Any]:
-        if not base:
-            return {"status": "not_checked", "url": ""}
-        url = base + path
-        try:
-            r = requests.get(url, timeout=15, headers=headers)
-            return {"status": "present" if r.status_code < 400 and r.text.strip() else "missing", "url": url, "http_status_code": r.status_code, "chars": len(r.text or "")}
-        except Exception as exc:
-            return {"status": "error", "url": url, "error": str(exc)[:240]}
+        bases = base_candidates()
+        if not bases:
+            return {"status": "not_checked", "url": "", "checked_urls": []}
+        attempts = []
+        for base in bases:
+            url = base.rstrip("/") + path
+            try:
+                r = requests.get(url, timeout=15, headers=headers)
+                row = {"url": url, "http_status_code": r.status_code, "chars": len(r.text or "")}
+                attempts.append(row)
+                if r.status_code < 400 and r.text.strip():
+                    return {"status": "present", "url": url, "http_status_code": r.status_code, "chars": len(r.text or ""), "checked_urls": attempts}
+            except Exception as exc:
+                attempts.append({"url": url, "error": str(exc)[:240]})
+        return {"status": "missing", "url": attempts[0].get("url") if attempts else "", "checked_urls": attempts}
+
     robots = fetch_status('/robots.txt')
     if discovery:
         robots["sitemap_entries_count"] = len(discovery.get("candidates") or [])
