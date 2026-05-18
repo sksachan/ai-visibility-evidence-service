@@ -230,6 +230,7 @@ def build_bodhi_bundle(run_id: str) -> dict[str, Any]:
     external_full = canonical.get("external_pages_full") or read_json(run_dir / "external_pages_full.json", {}) or {}
     visibility_matrix = canonical.get("visibility_matrix") or read_json(run_dir / "visibility_matrix.json", {}) or {}
     source_classification = canonical.get("source_classification") or read_json(run_dir / "source_classification.json", {}) or {}
+    site_ai_hygiene = read_json(run_dir / "site_ai_hygiene.json", {}) or (evidence_scope.get("site_ai_hygiene") if isinstance(evidence_scope, dict) else {}) or {}
 
     owned_pages = owned_full.get("pages", [])
     if not isinstance(owned_pages, list):
@@ -275,6 +276,8 @@ def build_bodhi_bundle(run_id: str) -> dict[str, Any]:
         "external_pages_full": external_payload,
         "visibility_matrix": visibility_matrix,
         "source_classification": source_classification,
+        "site_ai_hygiene": site_ai_hygiene,
+        "ai_discoverability_hygiene": site_ai_hygiene,
         "counts": {
             "owned_pages": len(slim_owned),
             "external_pages": len(slim_external),

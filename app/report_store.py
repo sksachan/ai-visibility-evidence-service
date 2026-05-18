@@ -242,6 +242,76 @@ def scan_latest_successful(brand: str | None, market: str | None, domain: str | 
     return candidates[0] if candidates else None
 
 
+
+
+def _epoch_from_any(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except Exception:
+        return 0
+
+def _report_history_row(manifest: dict[str, Any], status: dict[str, Any] | None = None) -> dict[str, Any]:
+    status = status or {}
+    run_id = str(manifest.get("run_id") or status.get("run_id") or "")
+    bundle = load_report_bundle(run_id) if run_id else None
+    executive = bundle.get("executive") if isinstance(bundle, dict) and isinstance(bundle.get("executive"), dict) else {}
+    headline = executive.get("headline_metrics") if isinstance(executive.get("headline_metrics"), dict) else {}
+    hygiene = None
+    if isinstance(bundle, dict):
+        hygiene = bundle.get("ai_discoverability_hygiene") or executive.get("ai_discoverability_hygiene")
+    return {
+        "run_id": run_id,
+        "brand": manifest.get("brand") or status.get("brand"),
+        "market": manifest.get("market") or status.get("market"),
+        "domain": manifest.get("domain") or status.get("domain"),
+        "stage": status.get("stage") or manifest.get("stage"),
+        "status": status.get("status") or manifest.get("status"),
+        "dashboard_ready": bool(manifest.get("dashboard_ready", True)),
+        "created_at_epoch": manifest.get("created_at_epoch") or status.get("created_at_epoch") or status.get("started_at_epoch"),
+        "completed_at_epoch": manifest.get("completed_at_epoch") or status.get("completed_at_epoch"),
+        "query_count": status.get("query_count") or headline.get("query_count"),
+        "owned_pages_scoreable": status.get("owned_pages_scoreable") or headline.get("owned_page_count"),
+        "external_pages_scoreable": status.get("external_pages_scoreable"),
+        "citation_count": status.get("external_citation_count") or status.get("serpapi_citation_count"),
+        "serpapi_enabled": bool((status.get("request") or {}).get("run_serpapi") or (status.get("request") or {}).get("enable_serpapi")),
+        "serpapi_query_count": status.get("serpapi_query_count") or status.get("serpapi_rows"),
+        "crawl_owned": bool((status.get("request") or {}).get("crawl_owned") or status.get("owned_pages_attempted")),
+        "crawl_external": bool((status.get("request") or {}).get("crawl_external") or status.get("external_pages_attempted")),
+        "crawl_success_rate": status.get("crawl_success_rate"),
+        "portfolio_id": status.get("query_portfolio_id") or manifest.get("query_portfolio_id"),
+        "source_run_id": status.get("source_run_id"),
+        "ai_hygiene": hygiene,
+        "label": f"{manifest.get('brand') or status.get('brand') or 'Brand'} / {manifest.get('market') or status.get('market') or 'Market'} — {run_id}",
+    }
+
+def _scan_report_history(brand: str | None, market: str | None, domain: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if not DATA_DIR.exists():
+        return []
+    for child in DATA_DIR.iterdir():
+        if not child.is_dir() or child.name.startswith("_") or child.name in {"latest", "latest_successful", "run_status", "portfolios"}:
+            continue
+        manifest = read_json(child / "report_manifest.json") or read_json(child / "run_manifest.json") or {}
+        if not manifest:
+            continue
+        if str(manifest.get("status") or "").lower() not in SUCCESS_STATES:
+            continue
+        if not bool(manifest.get("dashboard_ready", True)):
+            continue
+        if brand and normalise_key(manifest.get("brand")) != normalise_key(brand):
+            continue
+        if market and normalise_key(manifest.get("market")) != normalise_key(market):
+            continue
+        if domain and manifest.get("domain") and normalise_key(manifest.get("domain")) != normalise_key(domain):
+            continue
+        if not load_valid_report_bundle(child.name):
+            continue
+        status = load_run_status(child.name) or {}
+        rows.append(_report_history_row(manifest, status))
+    rows.sort(key=lambda x: _epoch_from_any(x.get("completed_at_epoch") or x.get("created_at_epoch")), reverse=True)
+    return rows[: max(1, min(int(limit or 20), 100))]
+
+
 class RunStatusRequest(BaseModel):
     status: str
     brand: str | None = None
@@ -392,6 +462,18 @@ def get_latest_report_bundle(brand: str = Query(...), market: str = Query(...), 
                 return bundle
         raise HTTPException(status_code=404, detail="Latest manifest exists but no dashboard-ready report bundle was found")
     return bundle
+
+
+
+
+@router.get("/reports/history")
+def get_report_history(brand: str | None = None, market: str | None = None, domain: str | None = None, limit: int = 20):
+    rows = _scan_report_history(brand, market, domain, limit)
+    return {
+        "status": "ok",
+        "count": len(rows),
+        "runs": rows,
+    }
 
 
 @router.get("/reports/latest-successful")

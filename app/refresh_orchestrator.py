@@ -10,7 +10,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import requests
 
@@ -296,15 +296,52 @@ def trigger_and_wait_for_portfolio(req: dict[str, Any], target_run_id: str) -> d
     raise RuntimeError("Portfolio run completed but no valid portfolio was found in Bodhi files or Evidence Service portfolio store. " + "; ".join(errors[:5]))
 
 
-def fetch_sitemap_urls(domain: str | None, sitemap_url: str | None, max_urls: int = 2000) -> list[str]:
-    if not sitemap_url and domain:
-        sitemap_url = domain.rstrip("/") + "/sitemap.xml"
-    if not sitemap_url:
-        return []
+def discover_sitemap_candidates(domain: str | None, explicit_sitemap_url: str | None = None) -> dict[str, Any]:
+    """Basic sitemap auto-discovery foundation.
+
+    Manual sitemap_url remains an override. If blank, check robots.txt Sitemap
+    directives and a few common sitemap locations. Full recursive scoring lands
+    in v3.5.3.
+    """
+    candidates: list[str] = []
+    errors: list[str] = []
+    robots_url = ""
+    robots_status = "not_checked"
+    headers = {"User-Agent": "ai-visibility-evidence-service/3.5.2"}
+    base = str(domain or "").strip().rstrip("/")
+    if explicit_sitemap_url:
+        candidates.append(str(explicit_sitemap_url).strip())
+    if base:
+        robots_url = base + "/robots.txt"
+        try:
+            r = requests.get(robots_url, timeout=15, headers=headers)
+            robots_status = "present" if r.status_code < 400 else "missing"
+            if r.status_code < 400:
+                for line in r.text.splitlines():
+                    if line.lower().startswith("sitemap:"):
+                        loc = line.split(":", 1)[1].strip()
+                        if loc:
+                            candidates.append(loc)
+        except Exception as exc:
+            robots_status = "error"
+            errors.append(f"robots.txt: {exc}")
+        for path in ["/sitemap.xml", "/sitemap_index.xml", "/sitemap-index.xml", "/sitemap/sitemap.xml", "/index.pages-sitemap.xml"]:
+            candidates.append(base + path)
+    # dedupe
+    out=[]; seen=set()
+    for c in candidates:
+        if c and c not in seen:
+            seen.add(c); out.append(c)
+    return {"explicit_override": bool(explicit_sitemap_url), "robots_url": robots_url, "robots_status": robots_status, "candidates": out, "errors": errors}
+
+
+def fetch_sitemap_urls(domain: str | None, sitemap_url: str | None, max_urls: int = 2000) -> tuple[list[str], dict[str, Any]]:
+    discovery = discover_sitemap_candidates(domain, sitemap_url)
     seen: set[str] = set()
     urls: list[str] = []
-    to_fetch = [sitemap_url]
-    headers = {"User-Agent": "ai-visibility-evidence-service/3.3"}
+    sitemaps_fetched: list[dict[str, Any]] = []
+    to_fetch = list(discovery.get("candidates") or [])
+    headers = {"User-Agent": "ai-visibility-evidence-service/3.5.2"}
     while to_fetch and len(urls) < max_urls:
         current = to_fetch.pop(0)
         if current in seen:
@@ -312,26 +349,67 @@ def fetch_sitemap_urls(domain: str | None, sitemap_url: str | None, max_urls: in
         seen.add(current)
         try:
             resp = requests.get(current, timeout=45, headers=headers)
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                sitemaps_fetched.append({"url": current, "status": "error", "http_status_code": resp.status_code, "url_count": 0})
+                continue
             root = ET.fromstring(resp.content)
             locs = [el.text.strip() for el in root.iter() if el.tag.lower().endswith("loc") and el.text]
+            added = 0
             for loc in locs:
-                if loc.lower().endswith(".xml") and len(seen) < 50:
+                lower = loc.lower()
+                if (lower.endswith(".xml") or ".xml?" in lower) and len(seen) < 75:
                     to_fetch.append(loc)
                 elif loc.startswith(("http://", "https://")):
-                    urls.append(loc)
+                    urls.append(loc); added += 1
                     if len(urls) >= max_urls:
                         break
-        except Exception:
-            break
-    # dedupe preserving order
-    out = []
-    seen2 = set()
+            sitemaps_fetched.append({"url": current, "status": "success", "http_status_code": resp.status_code, "loc_count": len(locs), "url_count": added})
+        except Exception as exc:
+            sitemaps_fetched.append({"url": current, "status": "error", "error": str(exc)[:240], "url_count": 0})
+    out=[]; seen2=set()
     for u in urls:
         if u not in seen2:
-            seen2.add(u)
-            out.append(u)
-    return out
+            seen2.add(u); out.append(u)
+    discovery.update({"sitemaps_fetched": sitemaps_fetched, "discovered_sitemaps": [x.get("url") for x in sitemaps_fetched if x.get("status") == "success"], "selected_url_count": len(out)})
+    return out, discovery
+
+
+def check_site_ai_hygiene(domain: str | None, owned_pages: list[dict[str, Any]], discovery: dict[str, Any] | None = None) -> dict[str, Any]:
+    base = str(domain or "").strip().rstrip("/")
+    headers = {"User-Agent": "ai-visibility-evidence-service/3.5.2"}
+    def fetch_status(path: str) -> dict[str, Any]:
+        if not base:
+            return {"status": "not_checked", "url": ""}
+        url = base + path
+        try:
+            r = requests.get(url, timeout=15, headers=headers)
+            return {"status": "present" if r.status_code < 400 and r.text.strip() else "missing", "url": url, "http_status_code": r.status_code, "chars": len(r.text or "")}
+        except Exception as exc:
+            return {"status": "error", "url": url, "error": str(exc)[:240]}
+    robots = fetch_status('/robots.txt')
+    if discovery:
+        robots["sitemap_entries_count"] = len(discovery.get("candidates") or [])
+        robots["discovered_sitemaps"] = discovery.get("discovered_sitemaps") or []
+    llms = fetch_status('/llms.txt')
+    total = len([p for p in owned_pages if isinstance(p, dict)])
+    pages_with_schema = 0; pages_with_json_ld = 0; schema_counts: dict[str,int] = {}; missing=[]
+    for p in owned_pages:
+        if not isinstance(p, dict):
+            continue
+        schema_types = p.get('schema_types_detected') if isinstance(p.get('schema_types_detected'), list) else []
+        if schema_types:
+            pages_with_schema += 1
+            for st in schema_types: schema_counts[str(st)] = schema_counts.get(str(st),0)+1
+        blob = str(p.get('markdown') or '') + ' ' + str(p.get('main_text') or '')
+        json_ld = bool(p.get('json_ld_present') or 'application/ld+json' in blob.lower() or schema_types)
+        if json_ld:
+            pages_with_json_ld += 1
+        else:
+            missing.append({"url": p.get('url') or p.get('final_url'), "title": p.get('title'), "mapped_query_count": len(p.get('related_queries_seed') or [])})
+    coverage = round((pages_with_json_ld / total) * 100, 1) if total else 0
+    priority = "high" if robots.get('status') != 'present' or coverage < 40 else "medium" if llms.get('status') != 'present' or coverage < 70 else "low"
+    summary = f"Robots.txt: {robots.get('status')}; LLMs.txt: {llms.get('status')}; JSON-LD/schema coverage: {pages_with_json_ld}/{total} owned pages ({coverage}%)."
+    return {"schema_version":"site_ai_hygiene.v1", "generated_at_epoch": now_epoch(), "robots_txt": robots, "llms_txt": llms, "structured_data": {"owned_pages_total": total, "pages_with_schema": pages_with_schema, "pages_with_json_ld": pages_with_json_ld, "coverage_pct": coverage, "schema_types_detected": sorted(schema_counts.items(), key=lambda x:x[1], reverse=True), "pages_missing_json_ld": missing[:20]}, "priority": priority, "summary": summary}
 
 
 def tokenise(value: Any) -> set[str]:
@@ -986,10 +1064,10 @@ def run_phase2_refresh(job_id: str, req: dict[str, Any]) -> None:
 
         write_run_status(target_run_id, "running", {"stage": "sitemap_inventory_running", "query_count": len(queries), "query_portfolio_id": portfolio_id})
         sitemap_url = req.get("sitemap_url")
-        sitemap_urls = fetch_sitemap_urls(req.get("domain"), sitemap_url, max_urls=int(req.get("sitemap_max_urls") or 2000))
+        sitemap_urls, sitemap_discovery = fetch_sitemap_urls(req.get("domain"), sitemap_url, max_urls=int(req.get("sitemap_max_urls") or 2000))
         if not sitemap_urls:
             sitemap_urls = fallback_owned_urls(req.get("domain"))
-        write_json(target / "sitemap_inventory.json", {"source": sitemap_url or (str(req.get("domain") or "").rstrip("/") + "/sitemap.xml"), "url_count": len(sitemap_urls), "urls": sitemap_urls, "generated_at_epoch": now_epoch(), "fallback_used": not bool(sitemap_urls)})
+        write_json(target / "sitemap_inventory.json", {"source": sitemap_url or "auto_discovered", "url_count": len(sitemap_urls), "urls": sitemap_urls, "generated_at_epoch": now_epoch(), "fallback_used": not bool(sitemap_urls), "sitemap_discovery": sitemap_discovery})
 
         owned_urls: list[str] = []
         mappings: list[dict[str, Any]] = []
@@ -1054,7 +1132,15 @@ def run_phase2_refresh(job_id: str, req: dict[str, Any]) -> None:
 
         # v3.5.1: canonicalise crawl/citation evidence before Auditor reads /bodhi-compact.
         canonical = canonicalise_bundle_files(target, {**req, "target_run_id": target_run_id})
-        write_run_status(target_run_id, "running", {"stage": "evidence_canonicalised", **(canonical.get("telemetry") or {})})
+        hygiene = check_site_ai_hygiene(req.get("domain"), (((canonical.get("owned_pages_full") or {}).get("pages") or []) if isinstance(canonical, dict) else []), locals().get("sitemap_discovery", {}))
+        write_json(target / "site_ai_hygiene.json", hygiene)
+        # Inject site hygiene into the core compact files for Auditor/frontend consumption.
+        for fname in ["audit_context.json", "evidence_scope.json", "visibility_matrix.json"]:
+            payload = read_json(target / fname, {}) or {}
+            if isinstance(payload, dict):
+                payload["site_ai_hygiene"] = hygiene
+                write_json(target / fname, payload)
+        write_run_status(target_run_id, "running", {"stage": "evidence_canonicalised", **(canonical.get("telemetry") or {}), "ai_hygiene_priority": hygiene.get("priority"), "llms_txt_status": (hygiene.get("llms_txt") or {}).get("status"), "robots_txt_status": (hygiene.get("robots_txt") or {}).get("status"), "json_ld_coverage_pct": (hygiene.get("structured_data") or {}).get("coverage_pct")})
 
         auditor = None
         if bool(req.get("trigger_auditor", True)):
