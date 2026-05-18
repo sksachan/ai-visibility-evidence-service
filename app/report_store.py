@@ -108,6 +108,66 @@ def extract_bundle_metadata(bundle: dict[str, Any], fallback_run_id: str | None 
     }
 
 
+
+
+def _list_len(value: Any) -> int:
+    return len(value) if isinstance(value, list) else 0
+
+
+def has_recognised_report_payload(bundle: Any) -> bool:
+    """Return True only for dashboard-ready frontend report bundles.
+
+    The Auditor can sometimes post a status/error shaped JSON object after a smoke
+    run with no portfolio/query evidence. Those objects should be stored for
+    debugging but must not replace the latest successful report because the
+    frontend cannot render them as an AI visibility dashboard.
+    """
+    if not isinstance(bundle, dict):
+        return False
+
+    # Direct canonical report fields.
+    list_fields = [
+        "query_workbench",
+        "queries",
+        "owned_url_readiness",
+        "owned_pages",
+        "cms_recommendations",
+        "page_level_cms_recommendations",
+        "action_checklist",
+    ]
+    if any(_list_len(bundle.get(k)) > 0 for k in list_fields):
+        return True
+
+    # Nested/common alternates used by older and newer bundles.
+    executive = bundle.get("executive") if isinstance(bundle.get("executive"), dict) else {}
+    if executive and (executive.get("headline") or executive.get("summary") or executive.get("ai_visibility_score") is not None):
+        # Executive-only bundles are not enough; require some drilldown evidence too.
+        pass
+
+    source_landscape = bundle.get("source_landscape") if isinstance(bundle.get("source_landscape"), dict) else {}
+    if _list_len(source_landscape.get("sources")) > 0 or _list_len(source_landscape.get("citation_domains")) > 0:
+        return True
+
+    visibility = bundle.get("visibility_matrix") if isinstance(bundle.get("visibility_matrix"), dict) else {}
+    if _list_len(visibility.get("queries")) > 0 or _list_len(visibility.get("rows")) > 0:
+        return True
+
+    # Preview-node style legacy shape.
+    preview = bundle.get("preview") if isinstance(bundle.get("preview"), dict) else {}
+    if _list_len(preview.get("tiles")) > 0:
+        return True
+    if _list_len(bundle.get("tiles")) > 0:
+        return True
+
+    return False
+
+
+def load_valid_report_bundle(run_id: str) -> dict[str, Any] | None:
+    bundle = load_report_bundle(run_id)
+    if bundle and has_recognised_report_payload(bundle):
+        return bundle
+    return None
+
 def update_latest_successful_index(manifest: dict[str, Any]) -> None:
     brand = manifest.get("brand")
     market = manifest.get("market")
@@ -174,6 +234,8 @@ def scan_latest_successful(brand: str | None, market: str | None, domain: str | 
         if domain and manifest.get("domain") and normalise_key(manifest.get("domain")) != normalise_key(domain):
             continue
         if not report_bundle_path(child.name).exists():
+            continue
+        if not load_valid_report_bundle(child.name):
             continue
         candidates.append(manifest)
     candidates.sort(key=lambda x: x.get("completed_at_epoch") or x.get("created_at_epoch") or 0, reverse=True)
@@ -260,6 +322,8 @@ async def store_report_bundle(run_id: str, request: Request, x_admin_token: str 
     if not isinstance(bundle, dict):
         raise HTTPException(status_code=400, detail="Report bundle must be a JSON object")
 
+    is_dashboard_ready = has_recognised_report_payload(bundle)
+
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     rdir = run_dir(run_id)
     rdir.mkdir(parents=True, exist_ok=True)
@@ -267,8 +331,8 @@ async def store_report_bundle(run_id: str, request: Request, x_admin_token: str 
 
     meta = extract_bundle_metadata(bundle, fallback_run_id=run_id)
     manifest = {
-        "status": "completed",
-        "stage": "report_bundle_ready",
+        "status": "completed" if is_dashboard_ready else "completed_invalid_report",
+        "stage": "report_bundle_ready" if is_dashboard_ready else "report_bundle_invalid",
         "run_id": run_id,
         "brand": meta.get("brand"),
         "market": meta.get("market"),
@@ -279,11 +343,16 @@ async def store_report_bundle(run_id: str, request: Request, x_admin_token: str 
         "created_at_epoch": now_epoch(),
         "completed_at_epoch": now_epoch(),
     }
+    manifest["dashboard_ready"] = is_dashboard_ready
+    if not is_dashboard_ready:
+        manifest["validation_error"] = "Stored report bundle does not contain a recognised dashboard payload; it was not promoted to latest successful."
+
     write_json(rdir / "report_manifest.json", manifest)
     write_json(rdir / "run_manifest.json", {**(read_json(rdir / "run_manifest.json", {}) or {}), **manifest})
-    write_run_status(run_id, "completed", manifest)
-    update_latest_successful_index(manifest)
-    return {"status": "stored", "manifest": manifest}
+    write_run_status(run_id, "completed" if is_dashboard_ready else "completed_invalid_report", manifest)
+    if is_dashboard_ready:
+        update_latest_successful_index(manifest)
+    return {"status": "stored" if is_dashboard_ready else "stored_not_promoted", "manifest": manifest}
 
 
 @router.get("/runs/{run_id}/report-bundle")
@@ -311,9 +380,17 @@ def get_latest_report_bundle(brand: str = Query(...), market: str = Query(...), 
     if not manifest:
         raise HTTPException(status_code=404, detail="No latest successful report bundle found")
 
-    bundle = load_report_bundle(manifest["run_id"])
+    bundle = load_valid_report_bundle(manifest["run_id"])
     if not bundle:
-        raise HTTPException(status_code=404, detail="Latest manifest exists but report bundle file is missing")
+        # The latest index may point at a malformed/empty smoke-test output.
+        # Fall back to scanning for the most recent dashboard-ready report instead
+        # of returning a frontend-breaking payload.
+        fallback = scan_latest_successful(brand, market, domain)
+        if fallback and fallback.get("run_id") != manifest.get("run_id"):
+            bundle = load_valid_report_bundle(fallback["run_id"])
+            if bundle:
+                return bundle
+        raise HTTPException(status_code=404, detail="Latest manifest exists but no dashboard-ready report bundle was found")
     return bundle
 
 
