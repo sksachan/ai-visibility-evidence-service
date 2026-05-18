@@ -378,11 +378,21 @@ def map_queries_to_sitemap(portfolio: dict[str, Any], urls: list[str], max_per_q
 
 
 
-def clean_text_value(value: Any) -> str:
+def clean_text_value(value: Any, max_len: int | None = None) -> str:
+    """Return a compact plain-text string safe for JSON report fields.
+
+    v3.4.7 introduced calls such as clean_text_value(text, 8000) when
+    preserving SerpAPI reconstructed_markdown. The helper accidentally kept
+    a single-argument signature, which caused refresh runs to fail before
+    SerpAPI execution. Keep the helper backwards-compatible and allow an
+    optional maximum length.
+    """
     if value is None:
         return ""
     text = html.unescape(str(value))
     text = re.sub(r"\s+", " ", text).strip()
+    if max_len is not None and max_len > 0 and len(text) > max_len:
+        return text[:max_len].rstrip()
     return text
 
 
