@@ -19,3 +19,5 @@ tmp/
 outputs/
 storage/
 *.log
+playwright-report/
+test-results/

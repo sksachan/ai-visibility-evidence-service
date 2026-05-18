@@ -125,6 +125,45 @@ def load_latest_portfolio(brand: str | None, market: str | None, domain: str | N
     return None
 
 
+
+def find_recent_portfolio(brand: str | None, market: str | None, domain: str | None = None, min_created_at: int | None = None) -> dict[str, Any] | None:
+    """Robust fallback for portfolio workflows that persist directly to /portfolios.
+
+    Some Bodhi Query Builder runs do not write downloadable run files. The portfolio
+    is instead POSTed to this Evidence Service. Route-level latest files can miss in
+    production when the domain key differs (www vs www3, trailing slash, etc.), so
+    scan stored portfolio JSON files and select the newest usable brand/market match.
+    """
+    root = portfolio_dir()
+    if not root.exists():
+        return None
+    target_brand = normalise_key(brand)
+    target_market = normalise_key(market)
+    target_domain = normalise_key(domain) if domain else ""
+    candidates: list[dict[str, Any]] = []
+    for path in root.glob("*.json"):
+        payload = read_json(path)
+        if not isinstance(payload, dict):
+            continue
+        if normalise_key(payload.get("brand")) != target_brand:
+            continue
+        if normalise_key(payload.get("market")) != target_market:
+            continue
+        if not is_usable_portfolio(payload, min_created_at=min_created_at):
+            continue
+        # Prefer exact domain when present, but do not require it. Query Builder
+        # uses the primary domain, while UI may pass a sitemap on www3.
+        payload_domain = normalise_key(payload.get("domain"))
+        payload["_domain_match_score"] = 1 if target_domain and payload_domain == target_domain else 0
+        candidates.append(payload)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: (x.get("_domain_match_score", 0), int(x.get("created_at_epoch") or 0)), reverse=True)
+    out = dict(candidates[0])
+    out.pop("_domain_match_score", None)
+    out.setdefault("schema_version", "brand_topic_query_portfolio.v1")
+    return out
+
 def is_usable_portfolio(portfolio: dict[str, Any] | None, min_created_at: int | None = None) -> bool:
     if not isinstance(portfolio, dict):
         return False
@@ -226,6 +265,19 @@ def trigger_and_wait_for_portfolio(req: dict[str, Any], target_run_id: str) -> d
     # downloadable file to the Bodhi run directory. In that case, use the latest
     # portfolio created for this brand/market/domain after this refresh started.
     latest = load_latest_portfolio(req.get("brand"), req.get("market"), req.get("domain"))
+    if not is_usable_portfolio(latest, min_created_at=run_started_epoch - 10):
+        latest = find_recent_portfolio(req.get("brand"), req.get("market"), req.get("domain"), min_created_at=run_started_epoch - 10)
+    if not is_usable_portfolio(latest, min_created_at=run_started_epoch - 10):
+        # Allow a short grace period for the Query Builder persistence POST to land
+        # after Bodhi marks the run complete.
+        for _ in range(12):
+            time.sleep(5)
+            latest = load_latest_portfolio(req.get("brand"), req.get("market"), req.get("domain"))
+            if is_usable_portfolio(latest, min_created_at=run_started_epoch - 10):
+                break
+            latest = find_recent_portfolio(req.get("brand"), req.get("market"), req.get("domain"), min_created_at=run_started_epoch - 10)
+            if is_usable_portfolio(latest, min_created_at=run_started_epoch - 10):
+                break
     if is_usable_portfolio(latest, min_created_at=run_started_epoch - 10):
         latest = normalise_portfolio_for_evidence(latest or {}, req)
         latest.setdefault("metadata", {})["bodhi_portfolio_run_id"] = bodhi_run_id
@@ -235,12 +287,12 @@ def trigger_and_wait_for_portfolio(req: dict[str, Any], target_run_id: str) -> d
             "query_portfolio_id": stored.get("portfolio_id"),
             "portfolio_query_count": len(stored.get("queries") or []),
             "portfolio_topic_count": len(stored.get("topics") or []),
-            "portfolio_source": "evidence_service_latest_fallback",
+            "portfolio_source": "evidence_service_latest_or_recent_fallback",
             "portfolio_file_errors": errors[:5],
         })
         return stored
 
-    raise RuntimeError("Portfolio run completed but no valid portfolio was found. " + "; ".join(errors[:5]))
+    raise RuntimeError("Portfolio run completed but no valid portfolio was found in Bodhi files or Evidence Service portfolio store. " + "; ".join(errors[:5]))
 
 
 def fetch_sitemap_urls(domain: str | None, sitemap_url: str | None, max_urls: int = 2000) -> list[str]:
