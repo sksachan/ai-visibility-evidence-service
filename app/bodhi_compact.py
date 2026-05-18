@@ -10,6 +10,8 @@ from typing import Any
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, Field
 
+from app.compact_normaliser import canonicalise_bundle_files, enrich_crawled_page
+
 router = APIRouter()
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data/evidence-runs"))
@@ -65,6 +67,7 @@ def pick(d: dict[str, Any], keys: list[str]) -> dict[str, Any]:
 
 
 def slim_owned_page(page: dict[str, Any]) -> dict[str, Any]:
+    page = enrich_crawled_page(page, external=False)
     keep = pick(page, [
         "url",
         "final_url",
@@ -87,6 +90,12 @@ def slim_owned_page(page: dict[str, Any]) -> dict[str, Any]:
         "title",
         "description",
         "status_code",
+        "http_status_code",
+        "resolved_url",
+        "domain",
+        "source_domain",
+        "word_count",
+        "text_chars",
         "canonical_url",
         "robots_meta",
         "language",
@@ -121,6 +130,7 @@ def slim_owned_page(page: dict[str, Any]) -> dict[str, Any]:
 
 
 def slim_external_page(page: dict[str, Any]) -> dict[str, Any]:
+    page = enrich_crawled_page(page, external=True)
     keep = pick(page, [
         "title",
         "url",
@@ -157,6 +167,12 @@ def slim_external_page(page: dict[str, Any]) -> dict[str, Any]:
         "raw_markdown_chars",
         "description",
         "status_code",
+        "http_status_code",
+        "resolved_url",
+        "domain",
+        "source_domain",
+        "word_count",
+        "text_chars",
         "canonical_url",
         "robots_meta",
         "language",
@@ -206,13 +222,14 @@ def build_bodhi_bundle(run_id: str) -> dict[str, Any]:
     if not run_dir.exists():
         raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
 
-    audit_context = read_json(run_dir / "audit_context.json", {}) or {}
-    evidence_scope = read_json(run_dir / "evidence_scope.json", {}) or {}
-    google_ai_mode = read_json(run_dir / "google_ai_mode_compact.json", {}) or {}
-    owned_full = read_json(run_dir / "owned_pages_full.json", {}) or {}
-    external_full = read_json(run_dir / "external_pages_full.json", {}) or {}
-    visibility_matrix = read_json(run_dir / "visibility_matrix.json", {}) or {}
-    source_classification = read_json(run_dir / "source_classification.json", {}) or {}
+    canonical = canonicalise_bundle_files(run_dir, write_files=True)
+    audit_context = canonical.get("audit_context") or read_json(run_dir / "audit_context.json", {}) or {}
+    evidence_scope = canonical.get("evidence_scope") or read_json(run_dir / "evidence_scope.json", {}) or {}
+    google_ai_mode = canonical.get("google_ai_mode_compact") or read_json(run_dir / "google_ai_mode_compact.json", {}) or {}
+    owned_full = canonical.get("owned_pages_full") or read_json(run_dir / "owned_pages_full.json", {}) or {}
+    external_full = canonical.get("external_pages_full") or read_json(run_dir / "external_pages_full.json", {}) or {}
+    visibility_matrix = canonical.get("visibility_matrix") or read_json(run_dir / "visibility_matrix.json", {}) or {}
+    source_classification = canonical.get("source_classification") or read_json(run_dir / "source_classification.json", {}) or {}
 
     owned_pages = owned_full.get("pages", [])
     if not isinstance(owned_pages, list):
@@ -264,10 +281,14 @@ def build_bodhi_bundle(run_id: str) -> dict[str, Any]:
             "owned_pages_scoreable": sum(
                 1 for p in slim_owned
                 if p.get("crawl_status") == "success"
-                and p.get("extraction_status") == "success"
-                and p.get("geo_analysis_ready") is True
-                and p.get("content_score_policy") == "score"
-                and (p.get("markdown") or p.get("content_extract"))
+                and (p.get("markdown") or p.get("content_extract") or p.get("text"))
+                and int(p.get("word_count") or 0) >= 20
+            ),
+            "external_pages_scoreable": sum(
+                1 for p in slim_external
+                if p.get("crawl_status") == "success"
+                and (p.get("content_extract") or p.get("text"))
+                and int(p.get("word_count") or 0) >= 20
             ),
             "external_failed_sources": len(external_payload["failed_sources"]),
         },

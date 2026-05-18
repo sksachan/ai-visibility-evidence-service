@@ -17,6 +17,7 @@ import requests
 from app.bodhi_client import BodhiClient
 from app.evidence_jobs import FullRefreshRequest, SerpApiJobRequest, run_full_refresh, run_serpapi_collection, make_job_id, update_job
 from app.portfolio_ingestion import extract_query_portfolio
+from app.compact_normaliser import canonicalise_bundle_files
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data/evidence-runs"))
 
@@ -1050,6 +1051,10 @@ def run_phase2_refresh(job_id: str, req: dict[str, Any]) -> None:
             write_run_status(target_run_id, "running", {"stage": "ai_citation_reuse_completed", **reuse_info})
         else:
             merge_serpapi_into_phase_files(target, {**req, "target_run_id": target_run_id})
+
+        # v3.5.1: canonicalise crawl/citation evidence before Auditor reads /bodhi-compact.
+        canonical = canonicalise_bundle_files(target, {**req, "target_run_id": target_run_id})
+        write_run_status(target_run_id, "running", {"stage": "evidence_canonicalised", **(canonical.get("telemetry") or {})})
 
         auditor = None
         if bool(req.get("trigger_auditor", True)):
