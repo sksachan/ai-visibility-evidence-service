@@ -685,6 +685,192 @@ def normalise_portfolio_for_evidence(portfolio: dict[str, Any], req: dict[str, A
     return out
 
 
+
+def query_field(q: dict[str, Any], *names: str) -> str:
+    for name in names:
+        v = q.get(name) if isinstance(q, dict) else None
+        if v not in (None, ""):
+            return clean_text_value(v)
+    return ""
+
+def query_category_key(q: dict[str, Any]) -> str:
+    return query_field(q, "journey_category", "brand_topic_category", "topic", "topic_id") or "uncategorised"
+
+def query_priority_score(q: dict[str, Any], shortlist_ids: set[str] | None = None) -> int:
+    shortlist_ids = shortlist_ids or set()
+    priority = query_field(q, "priority").lower()
+    commercial = query_field(q, "commercial_value").lower()
+    qtype = query_field(q, "query_type").lower()
+    intent = query_field(q, "intent", "intent_type").lower()
+    score = 0
+    score += {"high": 30, "p1": 30, "medium": 15, "p2": 15, "low": 3, "p3": 3}.get(priority, 8)
+    score += {"high": 24, "medium": 10, "low": 2}.get(commercial, 6)
+    if query_field(q, "query_id") in shortlist_ids:
+        score += 18
+    if qtype == "competitor_comparison":
+        score += 12
+    elif qtype == "non_branded":
+        score += 10
+    elif qtype in {"ownership_support", "local_market"}:
+        score += 8
+    elif qtype == "branded":
+        score += 5
+    if intent in {"comparison", "value_pricing", "reliability_trust", "category_discovery"}:
+        score += 6
+    elif intent in {"support", "ownership", "local"}:
+        score += 4
+    return score
+
+def select_balanced_queries(portfolio: dict[str, Any], query_limit: int, req: dict[str, Any] | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Select a deterministic, category-balanced subset from a larger portfolio.
+
+    This avoids the previous first-N behaviour, where a 20-query run could over-index
+    on the first few generated topics and miss finance, urban mobility or aftersales.
+    The policy is deliberately configurable through request fields while using stable
+    defaults that are suitable for demo/full-refresh evidence capture.
+    """
+    req = req or {}
+    all_queries = [q for q in (portfolio.get("queries") or []) if isinstance(q, dict) and q.get("query")]
+    requested = max(0, int(query_limit or len(all_queries) or 0))
+    if requested <= 0 or requested >= len(all_queries):
+        meta = {
+            "strategy": "all_queries",
+            "requested_limit": requested,
+            "available_queries": len(all_queries),
+            "selected_queries": len(all_queries),
+            "reason": "query_limit_empty_or_not_lower_than_available",
+        }
+        return all_queries, meta
+
+    strategy = str(req.get("query_selection_strategy") or "balanced").strip().lower()
+    if strategy in {"sequential", "first_n", "legacy"}:
+        selected = all_queries[:requested]
+        return selected, {
+            "strategy": strategy,
+            "requested_limit": requested,
+            "available_queries": len(all_queries),
+            "selected_queries": len(selected),
+            "reason": "legacy_first_n_requested",
+        }
+
+    # Soft, configurable guardrails rather than hardcoded query IDs.
+    min_non_branded_pct = float(req.get("query_selection_min_non_branded_pct") or 0.40)
+    min_competitor_pct = float(req.get("query_selection_min_competitor_pct") or 0.15)
+    min_local_count = int(req.get("query_selection_min_local_count") or (1 if requested >= 10 else 0))
+    min_ownership_count = int(req.get("query_selection_min_ownership_count") or (1 if requested >= 10 else 0))
+
+    def qid(q: dict[str, Any]) -> str:
+        return str(q.get("query_id") or q.get("id") or "")
+
+    shortlist = portfolio.get("recommended_audit_shortlist") or []
+    shortlist_ids: set[str] = set()
+    if isinstance(shortlist, list):
+        for item in shortlist:
+            if isinstance(item, str):
+                shortlist_ids.add(item)
+            elif isinstance(item, dict):
+                shortlist_ids.add(str(item.get("query_id") or item.get("id") or ""))
+
+    indexed = []
+    for idx, q in enumerate(all_queries):
+        indexed.append({
+            "idx": idx,
+            "query": q,
+            "category": query_category_key(q),
+            "query_type": query_field(q, "query_type").lower(),
+            "score": query_priority_score(q, shortlist_ids),
+        })
+
+    categories: list[str] = []
+    for row in indexed:
+        if row["category"] not in categories:
+            categories.append(row["category"])
+
+    def sort_key(row: dict[str, Any], selected_by_category: dict[str, int] | None = None):
+        selected_by_category = selected_by_category or {}
+        category_penalty = selected_by_category.get(row["category"], 0) * 16
+        return (-(row["score"] - category_penalty), selected_by_category.get(row["category"], 0), row["idx"])
+
+    selected_rows: list[dict[str, Any]] = []
+    selected_ids: set[int] = set()
+    selected_by_category: dict[str, int] = {c: 0 for c in categories}
+
+    def add_row(row: dict[str, Any]) -> bool:
+        if len(selected_rows) >= requested or row["idx"] in selected_ids:
+            return False
+        selected_rows.append(row)
+        selected_ids.add(row["idx"])
+        selected_by_category[row["category"]] = selected_by_category.get(row["category"], 0) + 1
+        return True
+
+    # Phase 1: ensure broad journey coverage by taking the best query per category.
+    for cat in categories:
+        candidates = [r for r in indexed if r["category"] == cat]
+        if not candidates:
+            continue
+        best = sorted(candidates, key=lambda r: (-r["score"], r["idx"]))[0]
+        add_row(best)
+        if len(selected_rows) >= requested:
+            break
+
+    def count_type(qtype: str) -> int:
+        return sum(1 for r in selected_rows if r["query_type"] == qtype)
+
+    def count_family(types: set[str]) -> int:
+        return sum(1 for r in selected_rows if r["query_type"] in types)
+
+    quotas = [
+        ("non_branded", max(0, min(requested, round(requested * min_non_branded_pct))), {"non_branded"}),
+        ("competitor_comparison", max(0, min(requested, round(requested * min_competitor_pct))), {"competitor_comparison"}),
+        ("local_market", min_local_count, {"local_market"}),
+        ("ownership_support", min_ownership_count, {"ownership_support"}),
+    ]
+
+    # Phase 2: satisfy soft query-type floors where available.
+    for label, floor, types in quotas:
+        while len(selected_rows) < requested and count_family(types) < floor:
+            candidates = [r for r in indexed if r["idx"] not in selected_ids and r["query_type"] in types]
+            if not candidates:
+                break
+            best = sorted(candidates, key=lambda r: sort_key(r, selected_by_category))[0]
+            add_row(best)
+
+    # Phase 3: fill the rest with highest-scoring queries, penalising overrepresented categories.
+    while len(selected_rows) < requested:
+        candidates = [r for r in indexed if r["idx"] not in selected_ids]
+        if not candidates:
+            break
+        best = sorted(candidates, key=lambda r: sort_key(r, selected_by_category))[0]
+        add_row(best)
+
+    # Stable report order: preserve original portfolio order for traceability once selected.
+    selected_rows = sorted(selected_rows, key=lambda r: r["idx"])
+    selected = [r["query"] for r in selected_rows]
+
+    type_counts: dict[str, int] = {}
+    category_counts: dict[str, int] = {}
+    for r in selected_rows:
+        type_counts[r["query_type"]] = type_counts.get(r["query_type"], 0) + 1
+        category_counts[r["category"]] = category_counts.get(r["category"], 0) + 1
+
+    meta = {
+        "strategy": "balanced_category_and_query_type",
+        "requested_limit": requested,
+        "available_queries": len(all_queries),
+        "selected_queries": len(selected),
+        "selected_query_ids": [qid(q) for q in selected],
+        "category_counts": category_counts,
+        "query_type_counts": type_counts,
+        "soft_guardrails": {
+            "min_non_branded_pct": min_non_branded_pct,
+            "min_competitor_pct": min_competitor_pct,
+            "min_local_count": min_local_count,
+            "min_ownership_count": min_ownership_count,
+        },
+        "fallback_to_legacy": False,
+    }
+    return selected, meta
+
 def fallback_owned_urls(domain: str | None) -> list[str]:
     if not domain:
         return []
@@ -1240,11 +1426,18 @@ def run_phase2_refresh(job_id: str, req: dict[str, Any]) -> None:
             portfolio = normalise_portfolio_for_evidence(portfolio, req)
             write_json(target / "query_portfolio.json", portfolio)
 
-        queries = (portfolio or {}).get("queries") or []
         query_limit = int(req.get("query_limit") or 50)
-        queries = queries[:query_limit]
+        queries, query_selection = select_balanced_queries(portfolio or {}, query_limit, req)
+        write_json(target / "selected_query_portfolio.json", {
+            "schema_version": "selected_query_portfolio.v1",
+            "portfolio_id": portfolio_id,
+            "brand": req.get("brand"),
+            "market": req.get("market"),
+            "selection": query_selection,
+            "queries": queries,
+        })
 
-        write_run_status(target_run_id, "running", {"stage": "sitemap_inventory_running", "query_count": len(queries), "query_portfolio_id": portfolio_id})
+        write_run_status(target_run_id, "running", {"stage": "sitemap_inventory_running", "query_count": len(queries), "query_portfolio_id": portfolio_id, "query_selection": query_selection})
         sitemap_url = req.get("sitemap_url")
         sitemap_urls, sitemap_discovery = fetch_sitemap_urls(req.get("domain"), sitemap_url, max_urls=int(req.get("sitemap_max_urls") or 2000))
         if not sitemap_urls:
