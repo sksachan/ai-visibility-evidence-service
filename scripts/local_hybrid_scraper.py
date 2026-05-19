@@ -362,6 +362,7 @@ def _extract_schema_and_metadata(soup: BeautifulSoup, url: str, status_code: int
         "hreflang": hreflang[:40],
         "json_ld_present": bool(json_ld_blocks),
         "schema_types": schema_types,
+        "json_ld_block_count": len(json_ld_blocks),
         "schema_block_count": len(json_ld_blocks),
     }
 

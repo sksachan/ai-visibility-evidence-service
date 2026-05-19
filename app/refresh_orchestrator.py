@@ -18,6 +18,7 @@ from app.bodhi_client import BodhiClient
 from app.evidence_jobs import FullRefreshRequest, SerpApiJobRequest, run_full_refresh, run_serpapi_collection, make_job_id, update_job
 from app.portfolio_ingestion import extract_query_portfolio
 from app.compact_normaliser import canonicalise_bundle_files
+from app.ai_hygiene import check_site_ai_hygiene
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data/evidence-runs"))
 
@@ -382,94 +383,6 @@ def fetch_sitemap_urls(domain: str | None, sitemap_url: str | None, max_urls: in
             seen2.add(u); out.append(u)
     discovery.update({"sitemaps_fetched": sitemaps_fetched, "discovered_sitemaps": [x.get("url") for x in sitemaps_fetched if x.get("status") == "success"], "selected_url_count": len(out)})
     return out, discovery
-
-
-def check_site_ai_hygiene(domain: str | None, owned_pages: list[dict[str, Any]], discovery: dict[str, Any] | None = None) -> dict[str, Any]:
-    headers = {"User-Agent": "ai-visibility-evidence-service/3.5.2.2"}
-
-    def base_candidates() -> list[str]:
-        values: list[str] = []
-        def add(url: str | None):
-            if not url:
-                return
-            try:
-                parsed = urlparse(str(url))
-                if parsed.scheme and parsed.netloc:
-                    candidate = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
-                    if candidate not in values:
-                        values.append(candidate)
-            except Exception:
-                return
-        add(domain)
-        # Some large OEM sites expose the meaningful product estate on a sibling
-        # crawl subdomain such as www3.*, while the user-facing domain is www.*.
-        # Try conservative wwwN variants so robots/llms detection is aligned with
-        # sitemap and owned-page hosts instead of only the primary marketing host.
-        try:
-            parsed_domain = urlparse(str(domain or ""))
-            if parsed_domain.scheme and parsed_domain.netloc.startswith("www."):
-                suffix = parsed_domain.netloc[4:]
-                for prefix in ["www3", "www2"]:
-                    add(f"{parsed_domain.scheme}://{prefix}.{suffix}")
-        except Exception:
-            pass
-        if discovery:
-            for key in ["robots_url", "discovered_sitemaps", "candidates", "sitemaps_fetched"]:
-                v = discovery.get(key)
-                if isinstance(v, list):
-                    for item in v:
-                        if isinstance(item, dict):
-                            add(item.get("url"))
-                        else:
-                            add(item)
-                else:
-                    add(v)
-        for page in owned_pages:
-            if isinstance(page, dict):
-                add(page.get("resolved_url") or page.get("final_url") or page.get("url") or page.get("source_url"))
-        return values
-
-    def fetch_status(path: str) -> dict[str, Any]:
-        bases = base_candidates()
-        if not bases:
-            return {"status": "not_checked", "url": "", "checked_urls": []}
-        attempts = []
-        for base in bases:
-            url = base.rstrip("/") + path
-            try:
-                r = requests.get(url, timeout=15, headers=headers)
-                row = {"url": url, "http_status_code": r.status_code, "chars": len(r.text or "")}
-                attempts.append(row)
-                if r.status_code < 400 and r.text.strip():
-                    return {"status": "present", "url": url, "http_status_code": r.status_code, "chars": len(r.text or ""), "checked_urls": attempts}
-            except Exception as exc:
-                attempts.append({"url": url, "error": str(exc)[:240]})
-        return {"status": "missing", "url": attempts[0].get("url") if attempts else "", "checked_urls": attempts}
-
-    robots = fetch_status('/robots.txt')
-    if discovery:
-        robots["sitemap_entries_count"] = len(discovery.get("candidates") or [])
-        robots["discovered_sitemaps"] = discovery.get("discovered_sitemaps") or []
-    llms = fetch_status('/llms.txt')
-    total = len([p for p in owned_pages if isinstance(p, dict)])
-    pages_with_schema = 0; pages_with_json_ld = 0; schema_counts: dict[str,int] = {}; missing=[]
-    for p in owned_pages:
-        if not isinstance(p, dict):
-            continue
-        schema_types = p.get('schema_types_detected') if isinstance(p.get('schema_types_detected'), list) else []
-        if schema_types:
-            pages_with_schema += 1
-            for st in schema_types: schema_counts[str(st)] = schema_counts.get(str(st),0)+1
-        blob = str(p.get('markdown') or '') + ' ' + str(p.get('main_text') or '')
-        json_ld = bool(p.get('json_ld_present') or 'application/ld+json' in blob.lower() or schema_types)
-        if json_ld:
-            pages_with_json_ld += 1
-        else:
-            missing.append({"url": p.get('url') or p.get('final_url'), "title": p.get('title'), "mapped_query_count": len(p.get('related_queries_seed') or [])})
-    coverage = round((pages_with_json_ld / total) * 100, 1) if total else 0
-    priority = "high" if robots.get('status') != 'present' or coverage < 40 else "medium" if llms.get('status') != 'present' or coverage < 70 else "low"
-    summary = f"Robots.txt: {robots.get('status')}; LLMs.txt: {llms.get('status')}; JSON-LD/schema coverage: {pages_with_json_ld}/{total} owned pages ({coverage}%)."
-    return {"schema_version":"site_ai_hygiene.v1", "generated_at_epoch": now_epoch(), "robots_txt": robots, "llms_txt": llms, "structured_data": {"owned_pages_total": total, "pages_with_schema": pages_with_schema, "pages_with_json_ld": pages_with_json_ld, "coverage_pct": coverage, "schema_types_detected": sorted(schema_counts.items(), key=lambda x:x[1], reverse=True), "pages_missing_json_ld": missing[:20]}, "priority": priority, "summary": summary}
 
 
 def tokenise(value: Any) -> set[str]:

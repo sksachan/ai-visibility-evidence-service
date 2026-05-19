@@ -11,6 +11,7 @@ from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from app.compact_normaliser import canonicalise_bundle_files, enrich_crawled_page
+from app.ai_hygiene import build_ai_discoverability_hygiene, is_valid_hygiene
 
 router = APIRouter()
 
@@ -99,6 +100,9 @@ def slim_owned_page(page: dict[str, Any]) -> dict[str, Any]:
         "canonical_url",
         "robots_meta",
         "language",
+        "json_ld_present",
+        "json_ld_block_count",
+        "schema_types",
         "schema_types_detected",
         "metadata",
         "visible_dates",
@@ -176,6 +180,9 @@ def slim_external_page(page: dict[str, Any]) -> dict[str, Any]:
         "canonical_url",
         "robots_meta",
         "language",
+        "json_ld_present",
+        "json_ld_block_count",
+        "schema_types",
         "schema_types_detected",
         "metadata",
         "visible_dates",
@@ -257,6 +264,15 @@ def build_bodhi_bundle(run_id: str) -> dict[str, Any]:
         "failed_sources": slim_failed(external_full.get("failed_sources")),
     }
 
+    if is_valid_hygiene(site_ai_hygiene):
+        ai_hygiene = build_ai_discoverability_hygiene(
+            owned_pages=slim_owned,
+            robots_txt=site_ai_hygiene.get("robots_txt"),
+            llms_txt=site_ai_hygiene.get("llms_txt"),
+        )
+    else:
+        ai_hygiene = build_ai_discoverability_hygiene(owned_pages=slim_owned)
+
     bundle = {
         "bundle_type": "bodhi_compact",
         "run_id": run_id,
@@ -276,8 +292,8 @@ def build_bodhi_bundle(run_id: str) -> dict[str, Any]:
         "external_pages_full": external_payload,
         "visibility_matrix": visibility_matrix,
         "source_classification": source_classification,
-        "site_ai_hygiene": site_ai_hygiene,
-        "ai_discoverability_hygiene": site_ai_hygiene,
+        "site_ai_hygiene": ai_hygiene,
+        "ai_discoverability_hygiene": ai_hygiene,
         "counts": {
             "owned_pages": len(slim_owned),
             "external_pages": len(slim_external),

@@ -10,6 +10,7 @@ from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from pydantic import BaseModel, Field, ConfigDict
+from app.ai_hygiene import hygiene_from_run_dir, is_valid_hygiene
 
 try:
     from app.evidence_jobs import FullRefreshRequest, run_full_refresh, make_job_id, update_job
@@ -215,7 +216,24 @@ def report_bundle_path(run_id: str) -> Path:
 
 
 def load_report_bundle(run_id: str) -> dict[str, Any] | None:
-    return read_json(report_bundle_path(run_id))
+    bundle = read_json(report_bundle_path(run_id))
+    if isinstance(bundle, dict):
+        return ensure_ai_hygiene(run_id, bundle, persist=True)
+    return bundle
+
+
+def ensure_ai_hygiene(run_id: str, bundle: dict[str, Any], *, persist: bool = False) -> dict[str, Any]:
+    if is_valid_hygiene(bundle.get("ai_discoverability_hygiene")):
+        return bundle
+    enriched = dict(bundle)
+    executive = enriched.get("executive") if isinstance(enriched.get("executive"), dict) else {}
+    nested = executive.get("ai_discoverability_hygiene") if isinstance(executive, dict) else None
+    hygiene = nested if is_valid_hygiene(nested) else hygiene_from_run_dir(run_dir(run_id))
+    enriched["ai_discoverability_hygiene"] = hygiene
+    enriched.setdefault("site_ai_hygiene", hygiene)
+    if persist:
+        write_json(report_bundle_path(run_id), enriched)
+    return enriched
 
 
 def scan_latest_successful(brand: str | None, market: str | None, domain: str | None = None) -> dict[str, Any] | None:
@@ -391,6 +409,7 @@ async def store_report_bundle(run_id: str, request: Request, x_admin_token: str 
     bundle = await request.json()
     if not isinstance(bundle, dict):
         raise HTTPException(status_code=400, detail="Report bundle must be a JSON object")
+    bundle = ensure_ai_hygiene(run_id, bundle)
 
     is_dashboard_ready = has_recognised_report_payload(bundle)
 
