@@ -6,6 +6,8 @@ import re
 import sys
 from pathlib import Path
 from typing import Any
+
+from app.technical_signals import enrich_page_technical_signals
 from urllib.parse import urlparse
 
 APP_ROOT = Path(__file__).resolve().parents[1]
@@ -140,6 +142,8 @@ def enrich_scraped_row(row: dict[str, Any]) -> dict[str, Any]:
         "rendered_fetch": manifest.get("rendered_fetch") or {},
         "pdf_parser": manifest.get("pdf_parser") or {},
         "schema_types_detected": metadata.get("schema_types") or [],
+        "json_ld_present": bool(metadata.get("json_ld_present") or metadata.get("schema_types")),
+        "json_ld_block_count": metadata.get("schema_block_count") or 0,
         "canonical_url": metadata.get("canonical") or "",
         "robots_meta": metadata.get("robots") or "",
         "language": metadata.get("language") or "",
@@ -166,7 +170,7 @@ def enrich_scraped_row(row: dict[str, Any]) -> dict[str, Any]:
         "numeric_fact_count": extraction_metrics.get("numeric_fact_count"),
     }
 
-    return enriched
+    return enrich_page_technical_signals(enriched)
 
 
 def selected_owned_pages_from_scope(scope: dict[str, Any]) -> list[dict[str, Any]]:

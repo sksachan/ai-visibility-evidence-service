@@ -18,6 +18,8 @@ from fastapi.responses import JSONResponse
 from markdownify import markdownify as md
 from pydantic import BaseModel, Field
 
+from app.technical_signals import collect_site_standards, enrich_page_technical_signals, technical_summary
+
 try:
     import trafilatura
 except Exception:
@@ -45,6 +47,7 @@ SERPAPI_ENGINE = os.environ.get("SERPAPI_ENGINE", "google_ai_mode")
 class FullRefreshRequest(BaseModel):
     brand: str = "Nissan"
     market: str = "Japan"
+    domain: str = ""
     source_run_id: str | None = None
     target_run_id: str
     mode: str = "crawl_only"
@@ -346,6 +349,8 @@ def extract_html_features(html: str, final_url: str) -> dict[str, Any]:
         "links": links[:500],
         "pdf_links": pdf_links[:100],
         "schema_blocks": schema_blocks[:20],
+        "json_ld_present": bool(schema_blocks),
+        "json_ld_block_count": len(schema_blocks),
         "schema_types_detected": detect_schema_types(schema_blocks),
         "text": best_text,
         "markdown": markdown if len(markdown) >= len(best_text) else best_text,
@@ -466,6 +471,8 @@ def crawl_one_url(url: str, timeout: int = 35, use_playwright_fallback: bool = T
             "links": features.get("links", []),
             "pdf_links": features.get("pdf_links", []),
             "schema_types_detected": features.get("schema_types_detected", []),
+            "json_ld_present": features.get("json_ld_present", False),
+            "json_ld_block_count": features.get("json_ld_block_count", 0),
             "text": features.get("text", ""),
             "markdown": markdown,
             "word_count": word_count,
@@ -477,7 +484,7 @@ def crawl_one_url(url: str, timeout: int = 35, use_playwright_fallback: bool = T
             result["metadata"],
             result["links"],
         )
-        return result
+        return enrich_page_technical_signals(result)
 
     except Exception as e:
         result["error"] = str(e)[:1000]
@@ -510,6 +517,7 @@ def build_compact_bundle(run_dir: Path):
         "external_pages_full": "external_pages_full.json",
         "visibility_matrix": "visibility_matrix.json",
         "source_classification": "source_classification.json",
+        "site_standards": "site_standards.json",
     }
 
     bundle = {}
@@ -531,126 +539,13 @@ def build_compact_bundle(run_dir: Path):
         "compact_bundle": str(run_dir / "compact_bundle.json"),
     }
 
+    owned_pages = ((bundle.get("owned_pages_full") or {}).get("pages") or [])
+    if isinstance(owned_pages, list):
+        bundle["technical_summary"] = technical_summary([p for p in owned_pages if isinstance(p, dict)])
     write_json(run_dir / "compact_bundle.json", bundle)
     write_json(run_dir / "manifest.json", manifest)
     write_json(run_dir / "run_manifest.json", manifest)
 
-
-
-def _domain_from_url(url: str) -> str:
-    try:
-        return urlparse(str(url)).netloc.lower().replace('www.', '')
-    except Exception:
-        return ''
-
-def _compact_text(value: Any, max_chars: int = 900) -> str:
-    if value is None:
-        return ''
-    if isinstance(value, str):
-        return re.sub(r"\s+", " ", value).strip()[:max_chars]
-    if isinstance(value, list):
-        parts = [_compact_text(v, max_chars=300) for v in value[:8]]
-        return re.sub(r"\s+", " ", " ".join([x for x in parts if x])).strip()[:max_chars]
-    if isinstance(value, dict):
-        for key in ('answer', 'summary', 'snippet', 'text', 'content', 'description'):
-            if key in value:
-                txt = _compact_text(value.get(key), max_chars=max_chars)
-                if txt:
-                    return txt
-    return ''
-
-def _walk_dicts(value: Any):
-    if isinstance(value, dict):
-        yield value
-        for v in value.values():
-            yield from _walk_dicts(v)
-    elif isinstance(value, list):
-        for v in value:
-            yield from _walk_dicts(v)
-
-def _extract_serpapi_references(raw: dict[str, Any], limit: int = 10) -> list[dict[str, Any]]:
-    refs: list[dict[str, Any]] = []
-    seen: set[str] = set()
-
-    def add_ref(obj: dict[str, Any], position: int | None = None):
-        url = obj.get('link') or obj.get('url') or obj.get('source_url') or obj.get('citation_url') or obj.get('redirect_link')
-        if not isinstance(url, str) or not url.startswith(('http://', 'https://')):
-            return
-        if url in seen:
-            return
-        seen.add(url)
-        refs.append({
-            'rank': len(refs) + 1 if position is None else position,
-            'title': _compact_text(obj.get('title') or obj.get('source') or obj.get('name') or _domain_from_url(url), 220),
-            'url': url,
-            'source_url': url,
-            'source_domain': _domain_from_url(url),
-            'source_name': _compact_text(obj.get('source') or obj.get('name') or _domain_from_url(url), 120),
-            'snippet': _compact_text(obj.get('snippet') or obj.get('description') or obj.get('text'), 500),
-            'source_type': 'external_citation',
-        })
-
-    preferred_keys = ('references', 'citations', 'sources', 'source_links')
-    for obj in _walk_dicts(raw):
-        for key in preferred_keys:
-            val = obj.get(key)
-            if isinstance(val, list):
-                for item in val:
-                    if isinstance(item, dict):
-                        add_ref(item)
-                    elif isinstance(item, str) and item.startswith(('http://', 'https://')):
-                        add_ref({'url': item})
-            elif isinstance(val, dict):
-                add_ref(val)
-
-    # Fallback to organic/search results if AI-mode specific references are not exposed.
-    for key in ('organic_results', 'top_stories', 'news_results', 'knowledge_graph'):
-        val = raw.get(key)
-        if isinstance(val, list):
-            for item in val:
-                if isinstance(item, dict):
-                    add_ref(item)
-        elif isinstance(val, dict):
-            add_ref(val)
-
-    return refs[:limit]
-
-def _extract_serpapi_answer_summary(raw: dict[str, Any]) -> str:
-    for key in ('ai_overview', 'ai_mode', 'answer_box', 'knowledge_graph'):
-        block = raw.get(key)
-        txt = _compact_text(block, 1200)
-        if txt:
-            return txt
-    for obj in _walk_dicts(raw):
-        for key in ('answer', 'summary', 'snippet', 'text'):
-            txt = _compact_text(obj.get(key), 1200) if isinstance(obj, dict) else ''
-            if txt and len(txt) > 40:
-                return txt
-    return ''
-
-def normalise_serpapi_row(query_id: str, query_text: str, q: dict[str, Any], raw: dict[str, Any], raw_file: str | None = None) -> dict[str, Any]:
-    refs = _extract_serpapi_references(raw, limit=10)
-    summary = _extract_serpapi_answer_summary(raw)
-    status = 'serpapi_completed_with_citations' if refs else 'serpapi_completed_no_citations'
-    return {
-        'query_id': query_id,
-        'query': query_text,
-        'query_type': q.get('query_type', ''),
-        'brand_topic_category': q.get('brand_topic_category') or q.get('journey_category') or q.get('topic') or '',
-        'journey_stage': q.get('journey_stage') or q.get('journey_category') or '',
-        'intent': q.get('intent', ''),
-        'answer_summary': summary or ('SerpAPI completed but no AI answer summary was returned.' if not refs else 'SerpAPI completed; citation references were returned.'),
-        'references': refs,
-        'top_citations': refs[:3],
-        'top_cited_sources': refs[:3],
-        'citation_count': len(refs),
-        'status': status,
-        'raw_response_keys': list(raw.keys())[:50] if isinstance(raw, dict) else [],
-        'reconstructed_markdown': _compact_text(raw.get('reconstructed_markdown'), 5000) if isinstance(raw, dict) else '',
-        'search_parameters': raw.get('search_parameters', {}) if isinstance(raw, dict) else {},
-        'search_metadata': raw.get('search_metadata', {}) if isinstance(raw, dict) else {},
-        'raw_file': raw_file,
-    }
 
 def run_serpapi_collection(job_id: str, req: SerpApiJobRequest):
     try:
@@ -679,7 +574,7 @@ def run_serpapi_collection(job_id: str, req: SerpApiJobRequest):
                 "engine": SERPAPI_ENGINE,
                 "q": query_text,
                 "api_key": SERPAPI_KEY,
-                "hl": "en",  # Executive dashboard output language; keep gl market-localised separately.
+                "hl": "ja" if req.market.lower() == "japan" else "en",
                 "gl": "jp" if req.market.lower() == "japan" else "us",
             }
 
@@ -688,29 +583,26 @@ def run_serpapi_collection(job_id: str, req: SerpApiJobRequest):
 
             write_json(raw_dir / f"{query_id}.json", raw)
 
-            compact_rows.append(normalise_serpapi_row(
-                query_id=query_id,
-                query_text=query_text,
-                q=q,
-                raw=raw if isinstance(raw, dict) else {},
-                raw_file=f"google_ai_mode/raw/{query_id}.json",
-            ))
+            compact_rows.append({
+                "query_id": query_id,
+                "query": query_text,
+                "query_type": q.get("query_type", ""),
+                "brand_topic_category": q.get("brand_topic_category", q.get("journey_category", "")),
+                "raw_response_keys": list(raw.keys())[:50],
+                "raw_serpapi_response": raw,
+            })
 
         google_payload = {
-            "schema_version": "google_ai_mode_compact.v2",
             "run_id": req.target_run_id,
             "brand": req.brand,
             "market": req.market,
             "source": "serpapi_live",
             "generated_at_epoch": now_epoch(),
-            "rows": compact_rows,
             "queries": compact_rows,
             "summary": {
                 "attempted_queries": len(queries),
                 "captured_queries": len(compact_rows),
                 "engine": SERPAPI_ENGINE,
-                "queries_with_citations": sum(1 for r in compact_rows if r.get("citation_count", 0) > 0),
-                "total_citations": sum(int(r.get("citation_count") or 0) for r in compact_rows),
             },
         }
 
@@ -790,6 +682,11 @@ def run_full_refresh(job_id: str, req: FullRefreshRequest):
                     use_playwright_fallback=req.use_playwright_fallback,
                 ))
 
+        owned_pages = [enrich_page_technical_signals(p) for p in owned_pages if isinstance(p, dict)]
+        external_pages = [enrich_page_technical_signals(p) for p in external_pages if isinstance(p, dict)]
+        standards_domain = req.domain or (owned_urls[0] if owned_urls else "")
+        site_standards = collect_site_standards(standards_domain) if standards_domain else {}
+
         owned_payload = {
             "run_id": req.target_run_id,
             "brand": req.brand,
@@ -824,6 +721,8 @@ def run_full_refresh(job_id: str, req: FullRefreshRequest):
 
         write_json(target_dir / "owned_pages_full.json", owned_payload)
         write_json(target_dir / "external_pages_full.json", external_payload)
+        if site_standards:
+            write_json(target_dir / "site_standards.json", site_standards)
 
         build_compact_bundle(target_dir)
 

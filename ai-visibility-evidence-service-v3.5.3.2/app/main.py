@@ -13,7 +13,6 @@ from app.parity_jobs import router as parity_jobs_router
 from app.parity_safe_jobs import router as parity_safe_jobs_router
 from app.parity_parallel_jobs import router as parity_parallel_jobs_router
 from app.bodhi_compact import router as bodhi_compact_router
-from app.report_store import router as report_store_router
 
 
 app = FastAPI(title="AI Visibility Evidence Service")
@@ -290,5 +289,3 @@ app.include_router(parity_safe_jobs_router)
 app.include_router(parity_parallel_jobs_router)
 
 app.include_router(bodhi_compact_router)
-
-app.include_router(report_store_router)

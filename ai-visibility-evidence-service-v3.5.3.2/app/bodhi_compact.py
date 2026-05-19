@@ -10,7 +10,7 @@ from typing import Any
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, Field
 
-from app.compact_normaliser import canonicalise_bundle_files, enrich_crawled_page
+from app.technical_signals import enrich_page_technical_signals, technical_summary
 
 router = APIRouter()
 
@@ -67,7 +67,6 @@ def pick(d: dict[str, Any], keys: list[str]) -> dict[str, Any]:
 
 
 def slim_owned_page(page: dict[str, Any]) -> dict[str, Any]:
-    page = enrich_crawled_page(page, external=False)
     keep = pick(page, [
         "url",
         "final_url",
@@ -90,16 +89,16 @@ def slim_owned_page(page: dict[str, Any]) -> dict[str, Any]:
         "title",
         "description",
         "status_code",
-        "http_status_code",
-        "resolved_url",
-        "domain",
-        "source_domain",
-        "word_count",
-        "text_chars",
         "canonical_url",
         "robots_meta",
         "language",
         "schema_types_detected",
+        "json_ld_present",
+        "json_ld_block_count",
+        "canonical_present",
+        "meta_description_present",
+        "structured_data",
+        "technical_signals",
         "metadata",
         "visible_dates",
         "content_regions",
@@ -111,6 +110,8 @@ def slim_owned_page(page: dict[str, Any]) -> dict[str, Any]:
         "pdf_parser",
     ])
 
+    page = enrich_page_technical_signals(page)
+    keep = {**keep, **pick(page, ["json_ld_present", "json_ld_block_count", "canonical_present", "meta_description_present", "structured_data", "technical_signals", "schema_types_detected"])}
     keep["markdown"] = truncate(page.get("markdown", ""), OWNED_MARKDOWN_MAX_CHARS)
     keep["content_extract"] = truncate(page.get("content_extract") or page.get("main_text") or page.get("text") or "", OWNED_CONTENT_EXTRACT_MAX_CHARS)
     keep["main_text"] = keep["content_extract"]
@@ -130,7 +131,6 @@ def slim_owned_page(page: dict[str, Any]) -> dict[str, Any]:
 
 
 def slim_external_page(page: dict[str, Any]) -> dict[str, Any]:
-    page = enrich_crawled_page(page, external=True)
     keep = pick(page, [
         "title",
         "url",
@@ -167,12 +167,6 @@ def slim_external_page(page: dict[str, Any]) -> dict[str, Any]:
         "raw_markdown_chars",
         "description",
         "status_code",
-        "http_status_code",
-        "resolved_url",
-        "domain",
-        "source_domain",
-        "word_count",
-        "text_chars",
         "canonical_url",
         "robots_meta",
         "language",
@@ -184,6 +178,8 @@ def slim_external_page(page: dict[str, Any]) -> dict[str, Any]:
         "content_metrics",
     ])
 
+    page = enrich_page_technical_signals(page)
+    keep = {**keep, **pick(page, ["json_ld_present", "json_ld_block_count", "canonical_present", "meta_description_present", "structured_data", "technical_signals", "schema_types_detected"])}
     # External pages are benchmark evidence; keep concise extract, not full markdown.
     keep["content_extract"] = truncate(page.get("content_extract") or page.get("main_text") or page.get("text") or page.get("markdown") or "", EXTERNAL_CONTENT_EXTRACT_MAX_CHARS)
     keep["main_text"] = keep["content_extract"]
@@ -222,15 +218,14 @@ def build_bodhi_bundle(run_id: str) -> dict[str, Any]:
     if not run_dir.exists():
         raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
 
-    canonical = canonicalise_bundle_files(run_dir, write_files=True)
-    audit_context = canonical.get("audit_context") or read_json(run_dir / "audit_context.json", {}) or {}
-    evidence_scope = canonical.get("evidence_scope") or read_json(run_dir / "evidence_scope.json", {}) or {}
-    google_ai_mode = canonical.get("google_ai_mode_compact") or read_json(run_dir / "google_ai_mode_compact.json", {}) or {}
-    owned_full = canonical.get("owned_pages_full") or read_json(run_dir / "owned_pages_full.json", {}) or {}
-    external_full = canonical.get("external_pages_full") or read_json(run_dir / "external_pages_full.json", {}) or {}
-    visibility_matrix = canonical.get("visibility_matrix") or read_json(run_dir / "visibility_matrix.json", {}) or {}
-    source_classification = canonical.get("source_classification") or read_json(run_dir / "source_classification.json", {}) or {}
-    site_ai_hygiene = read_json(run_dir / "site_ai_hygiene.json", {}) or (evidence_scope.get("site_ai_hygiene") if isinstance(evidence_scope, dict) else {}) or {}
+    audit_context = read_json(run_dir / "audit_context.json", {}) or {}
+    evidence_scope = read_json(run_dir / "evidence_scope.json", {}) or {}
+    google_ai_mode = read_json(run_dir / "google_ai_mode_compact.json", {}) or {}
+    owned_full = read_json(run_dir / "owned_pages_full.json", {}) or {}
+    external_full = read_json(run_dir / "external_pages_full.json", {}) or {}
+    visibility_matrix = read_json(run_dir / "visibility_matrix.json", {}) or {}
+    source_classification = read_json(run_dir / "source_classification.json", {}) or {}
+    site_standards = read_json(run_dir / "site_standards.json", {}) or {}
 
     owned_pages = owned_full.get("pages", [])
     if not isinstance(owned_pages, list):
@@ -242,8 +237,6 @@ def build_bodhi_bundle(run_id: str) -> dict[str, Any]:
 
     slim_owned = [slim_owned_page(p) for p in owned_pages if isinstance(p, dict)]
     slim_external = [slim_external_page(p) for p in external_pages if isinstance(p, dict)]
-    query_mapped_unique = sum(1 for p in slim_owned if p.get("query_mapped"))
-    inventory_selected = len(slim_owned)
 
     owned_payload = {
         **{k: v for k, v in owned_full.items() if k != "pages"},
@@ -278,24 +271,18 @@ def build_bodhi_bundle(run_id: str) -> dict[str, Any]:
         "external_pages_full": external_payload,
         "visibility_matrix": visibility_matrix,
         "source_classification": source_classification,
-        "site_ai_hygiene": site_ai_hygiene,
-        "ai_discoverability_hygiene": site_ai_hygiene,
+        "site_standards": site_standards,
+        "technical_summary": technical_summary(slim_owned),
         "counts": {
             "owned_pages": len(slim_owned),
-            "owned_inventory_pages": inventory_selected,
-            "owned_query_mapped_unique": query_mapped_unique,
             "external_pages": len(slim_external),
             "owned_pages_scoreable": sum(
                 1 for p in slim_owned
                 if p.get("crawl_status") == "success"
-                and (p.get("markdown") or p.get("content_extract") or p.get("text"))
-                and int(p.get("word_count") or 0) >= 20
-            ),
-            "external_pages_scoreable": sum(
-                1 for p in slim_external
-                if p.get("crawl_status") == "success"
-                and (p.get("content_extract") or p.get("text"))
-                and int(p.get("word_count") or 0) >= 20
+                and p.get("extraction_status") == "success"
+                and p.get("geo_analysis_ready") is True
+                and p.get("content_score_policy") == "score"
+                and (p.get("markdown") or p.get("content_extract"))
             ),
             "external_failed_sources": len(external_payload["failed_sources"]),
         },
@@ -335,125 +322,17 @@ def post_build_bodhi_compact(run_id: str, x_admin_token: str | None = Header(def
 
 
 class CleanupRunsRequest(BaseModel):
-    # Backwards-compatible accepted names. Earlier frontend/scripts used preserve_run_ids,
-    # while the original endpoint only respected keep_run_ids. Keep both.
     keep_run_ids: list[str] = Field(default_factory=list)
-    preserve_run_ids: list[str] = Field(default_factory=list)
     delete_run_ids: list[str] = Field(default_factory=list)
     dry_run: bool = True
     delete_jobs: bool = False
-    force: bool = False
-
-
-PROTECTED_RUN_DIRS = {
-    "run_status",
-    "latest_successful",
-    "portfolios",
-    "_jobs",
-}
-
-
-def dir_size_bytes(path: Path) -> int:
-    if not path.exists():
-        return 0
-    if path.is_file():
-        try:
-            return path.stat().st_size
-        except OSError:
-            return 0
-    total = 0
-    for child in path.rglob("*"):
-        try:
-            if child.is_file() or child.is_symlink():
-                total += child.stat().st_size
-        except OSError:
-            continue
-    return total
-
-
-def safe_stat_dir(path: Path) -> dict[str, Any]:
-    json_files = 0
-    total_files = 0
-    largest_files: list[dict[str, Any]] = []
-    if path.exists():
-        for child in path.rglob("*"):
-            try:
-                if not child.is_file():
-                    continue
-                total_files += 1
-                if child.suffix.lower() == ".json":
-                    json_files += 1
-                size = child.stat().st_size
-                largest_files.append({"path": str(child.relative_to(path)), "size_bytes": size, "size_mb": round(size / 1024 / 1024, 3)})
-            except OSError:
-                continue
-    largest_files.sort(key=lambda x: x["size_bytes"], reverse=True)
-    return {
-        "path": str(path),
-        "exists": path.exists(),
-        "size_bytes": dir_size_bytes(path),
-        "size_mb": round(dir_size_bytes(path) / 1024 / 1024, 3),
-        "total_files": total_files,
-        "json_files": json_files,
-        "largest_files": largest_files[:10],
-    }
-
-
-def list_run_dirs() -> list[dict[str, Any]]:
-    if not DATA_DIR.exists():
-        return []
-    rows = []
-    for p in DATA_DIR.iterdir():
-        if not p.is_dir():
-            continue
-        size = dir_size_bytes(p)
-        updated = 0.0
-        try:
-            updated = p.stat().st_mtime
-        except OSError:
-            pass
-        rows.append({
-            "run_id": p.name,
-            "path": str(p),
-            "protected": p.name in PROTECTED_RUN_DIRS,
-            "size_bytes": size,
-            "size_mb": round(size / 1024 / 1024, 3),
-            "updated_at_epoch": int(updated) if updated else None,
-        })
-    rows.sort(key=lambda x: x["size_bytes"], reverse=True)
-    return rows
-
-
-@router.get("/admin/storage")
-def storage_report(x_admin_token: str | None = Header(default=None)):
-    require_admin(x_admin_token)
-    usage = shutil.disk_usage(DATA_DIR if DATA_DIR.exists() else DATA_DIR.parent)
-    runs = list_run_dirs()
-    return {
-        "status": "ok",
-        "data_dir": str(DATA_DIR),
-        "disk": {
-            "total_bytes": usage.total,
-            "used_bytes": usage.used,
-            "free_bytes": usage.free,
-            "total_mb": round(usage.total / 1024 / 1024, 1),
-            "used_mb": round(usage.used / 1024 / 1024, 1),
-            "free_mb": round(usage.free / 1024 / 1024, 1),
-            "used_pct": round((usage.used / usage.total) * 100, 1) if usage.total else None,
-        },
-        "protected_run_dirs": sorted(PROTECTED_RUN_DIRS),
-        "run_count": len(runs),
-        "runs": runs,
-        "largest_runs": runs[:15],
-        "data_dir_detail": safe_stat_dir(DATA_DIR),
-    }
 
 
 @router.post("/admin/cleanup-runs")
 def cleanup_runs(req: CleanupRunsRequest, x_admin_token: str | None = Header(default=None)):
     require_admin(x_admin_token)
 
-    keep = set(req.keep_run_ids or []) | set(req.preserve_run_ids or []) | PROTECTED_RUN_DIRS
+    keep = set(req.keep_run_ids or [])
     delete = set(req.delete_run_ids or [])
 
     if not DATA_DIR.exists():
@@ -461,66 +340,41 @@ def cleanup_runs(req: CleanupRunsRequest, x_admin_token: str | None = Header(def
 
     deleted = []
     skipped = []
-    candidates: list[Path] = []
+    candidates = []
 
     for p in DATA_DIR.iterdir():
         if not p.is_dir():
             continue
         if p.name == "_jobs":
-            skipped.append({"run_id": p.name, "reason": "protected_system_dir"})
             continue
         if delete and p.name not in delete:
-            skipped.append({"run_id": p.name, "reason": "not_in_delete_run_ids"})
             continue
         if p.name in keep:
-            skipped.append({"run_id": p.name, "reason": "kept_or_protected"})
+            skipped.append({"run_id": p.name, "reason": "kept"})
             continue
         candidates.append(p)
 
-    protected_candidates = [p.name for p in candidates if p.name in PROTECTED_RUN_DIRS]
-    if protected_candidates and not req.force:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "message": "Refusing to delete protected/system directories without force=true.",
-                "protected_candidates": protected_candidates,
-                "protected_run_dirs": sorted(PROTECTED_RUN_DIRS),
-            },
-        )
-
     for p in candidates:
-        item = {"run_id": p.name, "path": str(p), "size_mb": round(dir_size_bytes(p) / 1024 / 1024, 3)}
         if req.dry_run:
-            item["dry_run"] = True
-            deleted.append(item)
+            deleted.append({"run_id": p.name, "path": str(p), "dry_run": True})
         else:
             shutil.rmtree(p, ignore_errors=True)
-            item["deleted"] = True
-            deleted.append(item)
+            deleted.append({"run_id": p.name, "path": str(p), "deleted": True})
 
     jobs_deleted = None
     jobs_path = DATA_DIR / "_jobs"
     if req.delete_jobs and jobs_path.exists():
-        if not req.force:
-            raise HTTPException(status_code=400, detail="Refusing to delete _jobs without force=true")
         if req.dry_run:
-            jobs_deleted = {"path": str(jobs_path), "dry_run": True, "size_mb": round(dir_size_bytes(jobs_path) / 1024 / 1024, 3)}
+            jobs_deleted = {"path": str(jobs_path), "dry_run": True}
         else:
             shutil.rmtree(jobs_path, ignore_errors=True)
             jobs_deleted = {"path": str(jobs_path), "deleted": True}
 
-    usage = shutil.disk_usage(DATA_DIR if DATA_DIR.exists() else DATA_DIR.parent)
     return {
         "status": "dry_run" if req.dry_run else "success",
         "data_dir": str(DATA_DIR),
-        "protected_run_dirs": sorted(PROTECTED_RUN_DIRS),
         "kept": sorted(list(keep)),
         "deleted_or_would_delete": deleted,
         "skipped": skipped,
         "jobs": jobs_deleted,
-        "disk_after": {
-            "used_mb": round(usage.used / 1024 / 1024, 1),
-            "free_mb": round(usage.free / 1024 / 1024, 1),
-            "used_pct": round((usage.used / usage.total) * 100, 1) if usage.total else None,
-        },
     }

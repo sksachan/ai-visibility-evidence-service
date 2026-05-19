@@ -15,15 +15,13 @@ from urllib.request import Request, urlopen
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 
+from app.technical_signals import collect_site_standards, enrich_page_technical_signals, technical_summary
+
 
 router = APIRouter()
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data/evidence-runs"))
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
-CRAWL_MAX_READ_BYTES = int(os.environ.get("CRAWL_MAX_READ_BYTES", "1200000"))
-CRAWL_MARKDOWN_MAX_CHARS = int(os.environ.get("CRAWL_MARKDOWN_MAX_CHARS", "5000"))
-CRAWL_TEXT_MAX_CHARS = int(os.environ.get("CRAWL_TEXT_MAX_CHARS", "5000"))
-
 
 
 class CrawlRequest(BaseModel):
@@ -31,6 +29,7 @@ class CrawlRequest(BaseModel):
     target_run_id: str
     brand: str = "Nissan"
     market: str = "Japan"
+    domain: str = ""
     crawl_owned: bool = True
     crawl_external: bool = True
     max_owned_urls: int = 5
@@ -188,7 +187,7 @@ def fetch_page(url: str, timeout: int = 30) -> dict[str, Any]:
             },
         )
         with urlopen(req, timeout=timeout) as resp:
-            body = resp.read(CRAWL_MAX_READ_BYTES)
+            body = resp.read(2_500_000)
             status = getattr(resp, "status", None)
             content_type = resp.headers.get("content-type", "")
 
@@ -199,37 +198,19 @@ def fetch_page(url: str, timeout: int = 30) -> dict[str, Any]:
         if "html" not in content_type.lower() and not url.lower().endswith((".html", ".htm", "/")):
             result["crawl_status"] = "skipped_non_html"
             result["error"] = f"Unsupported content-type: {content_type}"
-            return result
+            return enrich_page_technical_signals(result)
 
         html = body.decode("utf-8", errors="replace")
         parser = TextExtractor()
         parser.feed(html)
 
         text = parser.text
-        word_count = len(re.findall(r"\w+", text))
-        # Railway volume-safe persistence: keep compact snippets only. Large raw page
-        # bodies caused 500 MB volume exhaustion during full-refresh crawls.
-        compact_text = text[:CRAWL_TEXT_MAX_CHARS].rstrip()
-        compact_markdown = text[:CRAWL_MARKDOWN_MAX_CHARS].rstrip()
-        json_ld_blocks = re.findall(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, flags=re.I | re.S)
-        canonical_match = re.search(r'<link[^>]+rel=["\']canonical["\'][^>]+href=["\']([^"\']+)', html, flags=re.I)
-        description_match = re.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']*)', html, flags=re.I)
         result["title"] = parser.title
-        result["text"] = compact_text
-        result["markdown"] = compact_markdown
-        result["content_extract"] = compact_text
-        result["word_count"] = word_count
-        result["text_chars"] = len(text)
-        result["markdown_chars"] = len(compact_markdown)
-        result["raw_markdown_chars"] = len(text)
-        result["json_ld_present"] = bool(json_ld_blocks)
-        result["json_ld_block_count"] = len(json_ld_blocks)
-        result["schema_types_detected"] = sorted(set(re.findall(r'"@type"\s*:\s*"([^"\n]+)"', "\n".join(json_ld_blocks))))[:20]
-        result["canonical_url"] = canonical_match.group(1) if canonical_match else ""
-        result["description"] = description_match.group(1)[:500] if description_match else ""
-        result["crawl_storage_mode"] = "compact_only"
+        result["text"] = text
+        result["markdown"] = text
+        result["word_count"] = len(re.findall(r"\w+", text))
         result["crawl_status"] = "success" if text else "empty_extract"
-        return result
+        return enrich_page_technical_signals(result)
 
     except Exception as e:
         result["error"] = str(e)[:500]
@@ -248,6 +229,7 @@ def build_compact_bundle(run_dir: Path):
         "external_pages_full": "external_pages_full.json",
         "visibility_matrix": "visibility_matrix.json",
         "source_classification": "source_classification.json",
+        "site_standards": "site_standards.json",
     }
 
     bundle = {}
@@ -267,6 +249,9 @@ def build_compact_bundle(run_dir: Path):
         "updated_at_epoch": int(time.time()),
     }
 
+    owned_pages = ((bundle.get("owned_pages_full") or {}).get("pages") or [])
+    if isinstance(owned_pages, list):
+        bundle["technical_summary"] = technical_summary([p for p in owned_pages if isinstance(p, dict)])
     write_json(run_dir / "compact_bundle.json", bundle)
     write_json(run_dir / "manifest.json", manifest)
 
@@ -353,6 +338,11 @@ def run_crawl_job(job_id: str, req: CrawlRequest):
                 update_job(job_id, {"stage": "crawl_external", "current": i, "total": len(external_urls), "current_url": url})
                 external_pages.append(fetch_page(url))
 
+        owned_pages = [enrich_page_technical_signals(p) for p in owned_pages if isinstance(p, dict)]
+        external_pages = [enrich_page_technical_signals(p) for p in external_pages if isinstance(p, dict)]
+        standards_domain = req.domain or (owned_urls[0] if owned_urls else "")
+        site_standards = collect_site_standards(standards_domain) if standards_domain else {}
+
         owned_payload = {
             "run_id": req.target_run_id,
             "brand": req.brand,
@@ -381,6 +371,8 @@ def run_crawl_job(job_id: str, req: CrawlRequest):
 
         write_json(target_dir / "owned_pages_full.json", owned_payload)
         write_json(target_dir / "external_pages_full.json", external_payload)
+        if site_standards:
+            write_json(target_dir / "site_standards.json", site_standards)
         build_compact_bundle(target_dir)
 
         update_job(job_id, {
